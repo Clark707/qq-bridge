@@ -159,7 +159,7 @@ console.log('## MCP 工具与 bridge 路由');
     ok(bridge.includes(s), `bridge 包含 ${s}`);
   }
   ok(bridge.includes("v2ToolEnabled('sendVoice')"), 'send-voice 路由受 sendVoice 开关控制');
-  ok(/resolveVoicePathForV2[\s\S]{0,1200}allowAbsolutePath/.test(bridge), 'AI 通道绝对路径受 allowAbsolutePath 约束');
+  ok(/resolveVoicePathForV2[\s\S]{0,1400}allowOutside/.test(bridge), 'owner 库外绝对路径通过显式 allowOutside 开关');
 }
 
 console.log('## 安全边界（AI 通道来源限制）');
@@ -167,7 +167,7 @@ console.log('## 安全边界（AI 通道来源限制）');
   const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
   const fn = bridge.slice(bridge.indexOf('function resolveVoicePathForV2'), bridge.indexOf('function resolveVoicePathForOperator'));
   ok(/base64:|data:|https\?:/.test(fn), 'AI 通道拒绝 base64/data/http 来源');
-  ok(/allowAbsolutePath/.test(fn), 'AI 通道检查 allowAbsolutePath');
+  ok(/allowOutside/.test(fn) && /voicePathInsideLibrary/.test(fn), '默认通道仍检查语音库边界');
   const sendRoute = bridge.slice(bridge.indexOf("url.pathname === '/api/socialV2/send-voice'"), bridge.indexOf("url.pathname === '/api/socialV2/send-sticker'"));
   ok(sendRoute.includes('v2SessionAllowed(key)'), '语音发送校验会话白名单');
   ok(sendRoute.includes('agentTokenOk(key, token)'), '语音发送校验 agent token');
@@ -213,7 +213,7 @@ console.log('## 控制台契约');
   const html = fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8');
   const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
   ok(html.includes('data-v2-tool="sendVoice"'), '控制台有 sendVoice 工具开关');
-  ok(bridgeSrc.includes("'sendVoice']"), 'config API 的 toolFlags 含 sendVoice');
+  ok(/['"]sendVoice['"]/.test(bridgeSrc), 'config API 的 toolFlags 含 sendVoice');
   const uniq = (a) => [...new Set(a)].sort();
   const views = uniq([...html.matchAll(/data-view="([a-z0-9-]+)"/g)].map((m) => m[1]));
   const pages = uniq([...html.matchAll(/data-page="([a-z0-9-]+)"/g)].map((m) => m[1]));
@@ -250,6 +250,7 @@ console.log('## 回归：AI 语音通道不许穿出语音库（P1，曾可复�
     let abs = null;
     try { h.resolveVoicePathForV2(outside); } catch (e) { abs = e; }
     ok(Boolean(abs), '库外绝对路径被拒');
+    ok(h.resolveVoicePathForV2(outside, { allowOutside: true }).path === outside, 'owner 显式绝对路径可用');
     let sys = null;
     try { h.resolveVoicePathForV2('C:\\Windows\\Media\\Alarm01.wav'); } catch (e) { sys = e; }
     ok(Boolean(sys), '系统绝对路径被拒');

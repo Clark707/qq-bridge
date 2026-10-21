@@ -37,6 +37,8 @@ const ROOT = process.cwd();
 const DSH_MODULES = dshModulesDir();
 const DSH_HOME = path.join(os.homedir(), '.dsh');
 const BASE = process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
+const PROFILE = process.env.DSH_PROFILE || 'web';
+const PROFILE_DIR = path.join(DSH_HOME, 'profiles', PROFILE);
 
 let pass = 0, fail = 0;
 const results = [];
@@ -55,6 +57,17 @@ function skip(label, why) {
 const persona = await import(pathToFileURL(path.join(DSH_MODULES, '@deepseek-ai/dsh-persona/lib/index.js')).href);
 const YAML = await import(pathToFileURL(path.join(DSH_MODULES, 'js-yaml/index.js')).href);
 const yaml = YAML.default ?? YAML;
+class DshJsExpression {
+  constructor(value) { this.value = value; }
+}
+const dshYamlSchema = yaml.DEFAULT_SCHEMA.extend([
+  new yaml.Type('tag:yaml.org,2002:js', {
+    kind: 'scalar',
+    resolve: (value) => typeof value === 'string',
+    construct: (value) => new DshJsExpression(value),
+    instanceOf: DshJsExpression,
+  }),
+]);
 
 let oldRejected = false;
 try { persona.Config({ text: 'x' }); } catch { oldRejected = true; }
@@ -66,7 +79,7 @@ for (const p of ['qq-chat', 'qq-chat-v2']) {
   let schemaOk = false;
   try { persona.Config(row.config); schemaOk = true; } catch {}
   check(`preset ${p}: persona.config 通过 DSH schema`, schemaOk);
-  check(`preset ${p}: 保留 {{model}} / {{cwd}} 变量`, /\{\{model\}\}/.test(row.config.prefix) && /\{\{cwd\}\}/.test(row.config.suffix ?? ''));
+  check(`preset ${p}: 保留 {{model}} 且不使用 DSH 0.2.1 不存在的 {{cwd}}`, /\{\{model\}\}/.test(row.config.prefix) && !/\{\{cwd\}\}/.test(`${row.config.prefix ?? ''}${row.config.suffix ?? ''}`));
 }
 
 // ── 2. 部署侧：DSH 0.1.7 的 preset 机制 ──────────────────────────────────────
@@ -137,24 +150,31 @@ if (scanned.names.size === 0) {
   skip('守卫名单与 DSH 真实工具名对账', '未扫到任何 DSH 包（DSH 未安装？）');
 } else {
   const fabricated = [...guardNames].filter((n) => !n.startsWith('dev_') && !scanned.names.has(n));
-  check('守卫名单无拼错的假名（restrict 不会静默失效）', fabricated.length === 0, fabricated.join(', ') || `扫过 ${scanned.packages.length} 个包`);
+  if (PROFILE === 'web') {
+    check('守卫名单无拼错的假名（restrict 不会静默失效）', fabricated.length === 0, fabricated.join(', ') || `扫过 ${scanned.packages.length} 个包`);
+  } else {
+    skip('守卫名单无拼错的假名', `${PROFILE} profile 还挂有运行时/MCP 工具，包扫描无法证明这些名字是假的`);
+  }
 }
 
-const patch = fs.readFileSync(path.join(DSH_HOME, 'profiles/web/cordis.patch.yml'), 'utf8');
-const patchDoc = yaml.load(patch);
-const mcpIds = patchDoc.filter((e) => e?.insert).flatMap((e) => e.insert.map((x) => x.id));
-check('profile patch 含 3 个 MCP 且无重复', mcpIds.length === 3 && new Set(mcpIds).size === 3, mcpIds.join(', '));
-const snowlumaEntry = patchDoc.filter((e) => e?.insert).flatMap((e) => e.insert).find((x) => x.id === 'mcp-snowluma');
+const patch = fs.readFileSync(path.join(PROFILE_DIR, 'cordis.patch.yml'), 'utf8');
+const patchDoc = yaml.load(patch, { schema: dshYamlSchema });
+const QQ_MCP_IDS = ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe'];
+const bridgeMcpEntries = patchDoc.filter((e) => e?.insert).flatMap((e) => e.insert).filter((x) => QQ_MCP_IDS.includes(x?.id));
+const mcpIds = bridgeMcpEntries.map((x) => x.id);
+check('qq-bridge 的 3 个 MCP 各一条且无重复', mcpIds.length === 3 && new Set(mcpIds).size === 3, mcpIds.join(', '));
+const snowlumaEntry = bridgeMcpEntries.find((x) => x.id === 'mcp-snowluma');
 check('mcp-snowluma 带 toolCallTimeoutMs=725000', snowlumaEntry?.config?.toolCallTimeoutMs === 725000);
 check('mcp 路径指向本仓库', mcpIds.every((id) => {
-  const e = patchDoc.filter((x) => x?.insert).flatMap((x) => x.insert).find((y) => y.id === id);
+  const e = bridgeMcpEntries.find((y) => y.id === id);
+  if (!e?.config?.args) return false;
   return String(e.config.args[0]).includes('qq-bridge');
 }));
 
-const pkg = JSON.parse(fs.readFileSync(path.join(DSH_HOME, 'profiles/web/package.json'), 'utf8'));
+const pkg = JSON.parse(fs.readFileSync(path.join(PROFILE_DIR, 'package.json'), 'utf8'));
 check('profile bundles 含 qq-mode-console', pkg.dsh.profile.bundles.includes('qq-mode-console'));
 check('qq-mode-console link 依赖已注册', String(pkg.dependencies['qq-mode-console'] ?? '').startsWith('link:'));
-check('qq-mode-console 已 link 进 node_modules', fs.existsSync(path.join(DSH_HOME, 'profiles/web/node_modules/qq-mode-console')));
+check('qq-mode-console 已 link 进 node_modules', fs.existsSync(path.join(PROFILE_DIR, 'node_modules/qq-mode-console')));
 
 // ── 3. 仓库配置：模型 ───────────────────────────────────────────────────────
 const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));

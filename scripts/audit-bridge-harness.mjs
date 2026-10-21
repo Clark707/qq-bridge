@@ -13,6 +13,11 @@ import * as sensitive from '../src/sensitive.js';
 import * as wait from '../src/v2-wait.js';
 import * as safeFetch from '../src/safe-fetch.js';
 import * as forward from '../src/forward.js';
+import * as inboundMedia from '../src/inbound-media.js';
+import * as qqFaces from '../src/qq-faces.js';
+import * as memoryEvidence from '../src/memory-evidence.js';
+import * as linkCard from '../src/link-card.js';
+import * as contextPressure from '../src/context-pressure.js';
 import * as slang from '../src/slang-learner.js';
 import * as sticker from '../src/sticker-lib.js';
 import * as modelPrices from '../src/model-prices.js';
@@ -20,6 +25,10 @@ import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as stateAcl from '../src/state-acl.mjs';
+import * as ownerAgentPolicy from '../src/core/owner-agent-policy.mjs';
+import * as qqOwnerControl from '../src/core/qq-owner-control.mjs';
+import * as mediaProcessError from '../src/core/media-process-error.mjs';
+import * as sendRateLimit from '../src/core/send-rate-limit.mjs';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -45,6 +54,17 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   const fakeFetch = async (url, init = {}) => {
     const body = (() => { try { return JSON.parse(init.body ?? '{}'); } catch { return init.body; } })();
     calls.http.push({ url: String(url), body });
+    if (String(url).includes('/v1/memory/evidence')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          sufficient: true,
+          items: [{ ts: '2026-10-20', meta: '经历·debug', text: '以前修过 QQ 重复投递' }]
+        })
+      };
+    }
     const action = String(url).split('/').pop();
     if (action === 'fetch_ptt_text') {
       return { ok: true, status: 200, json: async () => ({ status: 'ok', retcode: 0, data: { text: 'fixture-transcript' } }) };
@@ -86,15 +106,29 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     callUnary: async (method, params) => { calls.cancelled.push({ method, params }); return success({ accepted: true }); },
   };
   class FakeBot {
-    async sendPrivateMessage(id, text) { calls.sent.push({ kind: 'private', id, text }); }
-    async sendGroupMessage(id, text) { calls.sent.push({ kind: 'group', id, text }); }
+    async sendPrivateMessage(id, message) { calls.sent.push({ kind: 'private', id, message, text: fakeMessagePlain(message) }); }
+    async sendGroupMessage(id, message) { calls.sent.push({ kind: 'group', id, message, text: fakeMessagePlain(message) }); }
     async getImage({ file }) {
       calls.images.push(file);
       // Valid 1 × 1 PNG, supplied entirely in memory by the fixture gateway.
       return { base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k3ioAAAAASUVORK5CYII=' };
     }
     async fetchFaceEntity(id) { calls.faces.push(id); return null; }
-    async request() { return { status: 'ok', retcode: 0, data: [{ emoji_id: 'fixture-sticker', url: 'https://public.invalid/sticker' }] }; }
+    async request(action) {
+      if (action === 'fetch_sys_faces') {
+        return { status: 'ok', retcode: 0, data: { packs: [{ emojis: [{ q_sid: '179', q_des: '/doge', emoji_name_alias: [] }] }] } };
+      }
+      if (action === 'fetch_ptt_text') {
+        return { status: 'ok', retcode: 0, data: { text: 'fixture-transcript' } };
+      }
+      return { status: 'ok', retcode: 0, data: [{ emoji_id: 'fixture-sticker', url: 'https://public.invalid/sticker' }] };
+    }
+  }
+  function fakeMessagePlain(message) {
+    if (!Array.isArray(message)) return String(message ?? '');
+    return message.map((segment) => segment?.type === 'text'
+      ? String(segment?.data?.text ?? '')
+      : segment?.type === 'face' ? `[face:${segment?.data?.id ?? ''}]` : '').join('');
   }
   let source = fs.readFileSync(path.join(root, 'src/bridge.js'), 'utf8');
   // 去掉顶层 import（VM 里靠 context 注入提供这些绑定）。
@@ -120,12 +154,18 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
+    markCapabilityV2, buildCapabilityStateV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    ownerPrivateNeedsAttentionV2, pauseGroupAutonomyV2, yieldGroupToOwnerV2,
+    groupSendScopeAllowedV2,
+    claimInitiativeV2,
+    outboundTextFromToolCall, postQueueEpisodeV2, turnInputBySession,
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
     collectors, setupSleepTimerV2,
     getInitialPrompt, setInitialPrompt, loadInitialPrompts, formatInitialPromptV2,
     initialPrompts, initialPromptMaxChars,
     extractMediaFromSegments, segmentsToText, fetchOneBotImage, fetchMediaData, resolveMediaList,
+    enrichInboundContent, inboundMediaEnabled, updateInboundV2Message,
     emojiCdnCandidates, getImageDimensions, acceptImageBuffer, MAX_MEDIA_BYTES, bot,
     isConversationBusyV2, v2TurnStartAt, turnLeaseNoted, TURN_BUSY_LEASE_MS,
     settingFromDshNamespace, selfIdentityTextV2, buildWakeReminderPromptV2,
@@ -158,9 +198,17 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     clearTimeout, setInterval: () => ({ unref() {} }), clearInterval: () => {},
     NodeApiClient: class { constructor() { return api; } },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
-    discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
-    ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
+    discoverDshLaunchToken: () => '',
+    // The default fixture treats the configured base as the validated DSH.
+    // Individual tests can override this through `globals` to exercise relocation.
+    discoverDshBaseUrl: async ({ preferredBaseUrl = 'http://127.0.0.1:3080' } = {}) => ({
+      baseUrl: preferredBaseUrl,
+      presets: [],
+    }),
+    unwrap, createTurnCollector,
+    ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...inboundMedia, ...qqFaces, ...memoryEvidence, ...linkCard, ...contextPressure, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
+    ...ownerAgentPolicy, ...qqOwnerControl, ...mediaProcessError, ...sendRateLimit,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

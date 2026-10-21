@@ -321,6 +321,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_get_my_recent_messages: 'getMyRecent',
   qq_get_message_detail: 'getMessageDetail',
   qq_get_active_members: 'getActiveMembers',
+  qq_schedule_intention: 'scheduleIntention',
   qq_memory_append: 'memory',
   qq_memory_query: 'memory',
   qq_memory_remove: 'memory',
@@ -344,6 +345,13 @@ const TOOL_CONFIG_FLAGS = {
   qq_get_self_image: 'getSelfImage',
   qq_sticker_note: 'stickerNote',
   qq_set_sticker_remark: 'setStickerRemark',
+  qq_list_images: 'sendImage',
+  qq_compose_image: 'sendImage',
+  qq_send_image: 'sendImage',
+  qq_generate_image: 'sendImage',
+  qq_synthesize_voice: 'sendVoice',
+  qq_owner_action: 'ownerActions',
+  qq_owner_list_actions: 'ownerActions',
 };
 const disabledTools = [];
 {
@@ -763,6 +771,43 @@ if (cfg.socialV2?.tools?.sendPoke !== false) {
   );
 }
 
+if (cfg.socialV2?.tools?.scheduleIntention !== false) {
+  server.tool(
+    'qq_schedule_intention',
+    '登记一条具体的主动意图：到某个时间后，如果这件事仍然值得说，就叫醒你一次。适合“等结果出来再告诉落柯”“过一会儿回来追问上次没聊完的事”。不用于一般回复，也不用于没有具体内容的气氛搭话；同一话题会去重，离线时不会发送。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      reason: z.string().min(4).max(500).describe('为什么以后要主动说，例如“图片链路验收完成后告诉落柯真实回执”'),
+      contentHint: z.string().max(500).optional().describe('到时候应当带上的具体内容/问题，不要写空泛的“记得说话”'),
+      dueInMinutes: z.number().min(1).max(10080).optional().describe('多少分钟后可尝试；与 dueAt 二选一'),
+      dueAt: z.string().optional().describe('ISO 时间或 epoch 毫秒；与 dueInMinutes 二选一'),
+      expiresInHours: z.number().min(1).max(168).optional().describe('过期时间，默认 24 小时'),
+      sourceRef: z.string().max(300).optional().describe('可选：相关任务/消息/文件标识')
+    },
+    async ({ key, token, reason, contentHint, dueInMinutes, dueAt, expiresInHours, sourceRef }) => {
+      try {
+        const due = dueAt || (dueInMinutes
+          ? new Date(Date.now() + Number(dueInMinutes) * 60000).toISOString()
+          : '');
+        if (!due) {
+          return { content: [{ type: 'text', text: '需要 dueInMinutes 或 dueAt' }], isError: true };
+        }
+        const expires = new Date(Date.now() + Number(expiresInHours || 24) * 3600000).toISOString();
+        const data = await agentApi('/api/socialV2/schedule-intention', {
+          method: 'POST',
+          body: JSON.stringify({ key, reason, contentHint, dueAt: due, expiresAt: expires, sourceRef }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `登记主动意图失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
 server.tool(
   'qq_wait_for_messages',
   '等待分两种用途。首答前已读消息、只想确认有没有补充：用 purpose="reply"，按最后来信时间补足 quietMs 静默，已安静足够就立即返回；读取/思考时新到的消息也会返回，新消息重算静默。timeoutMs 是最长预算，不要求等满；预算到但 quiet=false 不代表对方已说完。此用途绝不代替沉睡前观察。等对方继续说、等回复或睡前观察：用默认 purpose="messages"；先等新消息，收到后才按 quietMs 等静默，没有新消息会等到 timeoutMs，单传 quietMs 不会缩短总等待。静默下限由后台配置，默认 10000ms。直接看 newMessages、unreadCount 和 readThroughSeq，返回消息无需重复查询；仍有未展示未读才补读。决定潜水/收尾时才用默认用途加 timeoutMs=300000 完成沉睡前观察，不能把 5 分钟观察放在首答之前；短等待不能代替。全程无人说话返回 preSleepWaitSatisfied=true；观察期间来了新消息返回 preSleepWaitObserved=true，读后不需参与可收尾，参与回复则下次收尾重新观察。preSleepWaitRemainingMs 仅供准备收尾时参考。',
@@ -1162,11 +1207,11 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
 if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
   server.tool(
     'qq_send_voice',
-    '在指定会话发一条 QQ 语音（把语音库里准备好的音频当语音条发出去）。voice 传 qq_list_voices 返回的 name（文件名，可带子目录），也可以直接传语音库里的文件名（不带扩展名也能匹配）。注意：① 只能发语音库（qq-bridge/audio/）里的文件，不能发任意本地路径，也不能发 URL/base64；② 受时长与频率上限约束（见 qq_list_voices 的 limits），超限会被拒绝；③ 语音是「开口说话」的强表达，别滥用，闲聊里偶尔发一条即可；④ 返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对用户说你发了语音；⑤ readback 只对「收到的」语音有意义（QQ 会转写别人的语音），自己发的语音一般拿不到转写文本，默认关闭，别依赖它。',
+    '把准备好的音频当 QQ 语音条发出去。owner 私聊可以直接传任意本地音频绝对路径；其他会话只能传语音库（qq-bridge/audio/）里的文件名。返回 verified=true 表示已用 get_msg 回读到 record 段；只有 verified=true 才能说语音已经送达。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      voice: z.string().describe('语音库里的文件名（来自 qq_list_voices 的 name，可带子目录/可省略扩展名）'),
+      voice: z.string().describe('owner 私聊可用本地绝对路径；其他会话用语音库文件名'),
       label: z.string().optional().describe('可选：写进会话记录里的说明，如「说了句晚安」'),
       verify: z.boolean().optional().describe('是否回读校验语音已落地（默认 true，建议保持开启）'),
       readback: z.boolean().optional().describe('是否额外索取 QQ 转写文本（自己发的语音通常没有，默认 false）')
@@ -1237,6 +1282,209 @@ if (cfg.socialV2?.tools?.getSelfImage !== false) {
         };
       } catch (error) {
         return { content: [{ type: 'text', text: `获取形象图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
+  server.tool(
+    'qq_synthesize_voice',
+    '用本机 GPT-SoVITS 合成乌塔自己的语音。send=true 时合成后立即作为 QQ 语音条发送，并回读验证；send=false 只生成文件。只允许 owner 私聊。长任务会启动本地模型，可能需要几十秒到数分钟。',
+    {
+      key: z.string().describe('会话 key，owner 私聊'),
+      token: z.string().describe('会话令牌'),
+      text: z.string().describe('要说的中文文本，最多 500 字'),
+      send: z.boolean().optional().describe('是否合成后直接发送，默认 true'),
+      speed: z.number().min(0.5).max(2).optional().describe('语速，默认 1'),
+      seed: z.number().optional().describe('采样种子')
+    },
+    async ({ key, token, text, send, speed, seed }) => {
+      try {
+        const data = await agentApi('/api/socialV2/synthesize-voice', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, text, send: send !== false, speed, seed }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 1_000_000,
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `合成语音失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.sendImage !== false) {
+  server.tool(
+    'qq_list_images',
+    '列出 QQ 图片库里可发送的本地图片（相对路径、大小、更新时间）。图片库只允许 qq-bridge/media/images 内的文件；合成图会落在 generated/。发送前必须先看到图片内容并完成自审。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      limit: z.number().optional().describe('最多返回多少张，默认 100，最大 200')
+    },
+    async ({ key, token, limit }) => {
+      try {
+        const q = new URLSearchParams({ key, limit: String(limit ?? 100) });
+        const data = await agentApi(`/api/socialV2/images?${q.toString()}`, {
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `列出图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_compose_image',
+    '用图片库里的底图生成一张合成图：可叠加另一张图、写一段短文字，并立即把生成结果作为图像返回给你预览。生成只落盘、不发送；先看清楚结果，再调用 qq_send_image。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      base: z.string().describe('底图在图片库内的相对路径，例如 generated/xxx.png'),
+      overlay: z.string().optional().describe('可选：叠加图在图片库内的相对路径'),
+      text: z.string().max(200).optional().describe('可选：叠加到图片上的短文字'),
+      position: z.enum(['bottom', 'top', 'center']).optional().describe('文字位置，默认 bottom'),
+      overlayPosition: z.enum(['top-left', 'top-right', 'bottom-left', 'bottom-right', 'center']).optional().describe('叠加图位置，默认 bottom-right'),
+      overlayScale: z.number().min(0.05).max(0.8).optional().describe('叠加图占底图宽度比例，默认 0.28'),
+      fontSize: z.number().min(12).max(128).optional().describe('文字字号，默认 48')
+    },
+    async (args) => {
+      try {
+        const data = await agentApi('/api/socialV2/compose-image', {
+          method: 'POST',
+          body: JSON.stringify(args),
+          headers: { 'x-agent-token': args.token },
+          timeoutMs: 120000
+        });
+        const artifact = data?.artifact ?? {};
+        const content = [{
+          type: 'text',
+          text: serializeModelData({
+            ok: true,
+            artifact,
+            hint: '这是发送前预览。确认内容、受众和风险后，再把 artifact.relativePath 传给 qq_send_image；不发送时到此为止。'
+          })
+        }];
+        if (data?.image?.data && data?.image?.mimeType) {
+          content.push({ type: 'image', mimeType: data.image.mimeType, data: data.image.data });
+        }
+        return { content };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `合成图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_send_image',
+    '把一张图片发到指定 QQ 会话。owner 私聊可以直接传任意本地图片绝对路径；其他会话只能传图片库相对路径。发送前必须写短自审：intent 说明为什么发，expected 说明预期效果；桥接会检查格式、大小、像素和频率，并在发送后用 get_msg 回读 image 段。只有返回 verified=true 才能说图片已经送达。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      image: z.string().describe('owner 私聊可用本地绝对路径；其他会话用图片库相对路径'),
+      intent: z.string().min(2).max(240).describe('为什么发这张图，例如“回一张刚生成的晚安图”'),
+      expected: z.string().min(2).max(240).describe('预期效果，例如“看懂图里的文字后继续聊”'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（可选）'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('群聊中要 @ 的 QQ 号（私聊不可用）')
+    },
+    async ({ key, token, image, intent, expected, replyToMessageId, atUserId }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-image', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            image,
+            replyToMessageId,
+            atUserId: atUserId ?? null,
+            review: { intent, expected }
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 300000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发送图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_generate_image',
+    '用本机 Qwen-Image 根据提示词生成图片。send=true 时生成后立即发到 owner 私聊并回读验证；send=false 只生成。只允许 owner 私聊。长任务会按需启动 ComfyUI，可能耗时数分钟。',
+    {
+      key: z.string().describe('会话 key，owner 私聊'),
+      token: z.string().describe('会话令牌'),
+      prompt: z.string().min(4).describe('图片提示词'),
+      send: z.boolean().optional().describe('是否生成后直接发送，默认 true'),
+      width: z.number().int().min(256).max(1536).optional().describe('宽度，默认 1024'),
+      height: z.number().int().min(256).max(1536).optional().describe('高度，默认 1536'),
+      steps: z.number().int().min(1).max(40).optional().describe('采样步数，默认 25'),
+      seed: z.number().optional().describe('随机种子'),
+      timeoutSeconds: z.number().int().min(120).max(1800).optional().describe('生成超时，默认 1800')
+    },
+    async ({ key, token, prompt, send, width, height, steps, seed, timeoutSeconds }) => {
+      try {
+        const data = await agentApi('/api/socialV2/generate-image', {
+          method: 'POST',
+          body: JSON.stringify({ key, prompt, send: send !== false, width, height, steps, seed, timeoutSeconds }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 1_900_000,
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `生成图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.ownerActions !== false) {
+  server.tool(
+    'qq_owner_list_actions',
+    '列出 SnowLuma 提供的完整 QQ 原生动作，用于 owner 私聊里的改资料、签名、头像、QQ 空间说说/评论/点赞等。消息发送仍用专用 qq_send_message 等工具。',
+    {
+      key: z.string().describe('会话 key，owner 私聊'),
+      token: z.string().describe('会话令牌'),
+      q: z.string().optional().describe('可选搜索词，例如 profile、qzone、头像、说说')
+    },
+    async ({ key, token, q }) => {
+      try {
+        const params = new URLSearchParams({ key });
+        if (q) params.set('q', q);
+        const data = await agentApi(`/api/socialV2/owner-actions?${params.toString()}`, {
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000,
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `读取 QQ 动作失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_owner_action',
+    '执行 owner 私聊专属的完整 QQ 原生动作。可改昵称/签名/头像，发表、评论、点赞、删除说说等。action 先用 qq_owner_list_actions 查；params 直接传 SnowLuma 对应参数。通用动作禁止借用群发/私聊发送来绕过专用发送工具。',
+    {
+      key: z.string().describe('会话 key，owner 私聊'),
+      token: z.string().describe('会话令牌'),
+      action: z.string().describe('SnowLuma 动作名，例如 set_qq_profile / set_self_longnick / send_qzone_msg'),
+      params: z.record(z.string(), z.any()).optional().describe('SnowLuma 动作参数')
+    },
+    async ({ key, token, action, params }) => {
+      try {
+        const data = await agentApi('/api/socialV2/owner-action', {
+          method: 'POST',
+          body: JSON.stringify({ key, action, params: params ?? {} }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 180000,
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `QQ 动作失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

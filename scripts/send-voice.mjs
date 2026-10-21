@@ -64,7 +64,9 @@ function loadConfig() {
 
 const cfg = loadConfig();
 const httpUrl = String(val('snowluma', cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000')).replace(/\/+$/, '');
-const accessToken = String(val('token', cfg.snowluma?.accessToken || ''));
+// OneBot 的 HTTP(3000) 与 WebSocket(3001) 各有一把 token，config 原本只有一个字段。
+// 本脚本走 HTTP，优先取 httpAccessToken；没有再退回 accessToken（单适配器部署仍成立）。
+const accessToken = String(val('token', cfg.snowluma?.httpAccessToken || cfg.snowluma?.accessToken || ''));
 const consolePort = Number(val('console-port', cfg.consolePort)) || 3100;
 const consoleToken = String(
   val('console-token', cfg.consoleToken || process.env.QQ_CONSOLE_TOKEN || readConsoleTokenFile() || '')

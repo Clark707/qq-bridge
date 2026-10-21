@@ -16,6 +16,15 @@ const record = args.includes('--record-baseline');
 const artifacts = args.find(x => x.startsWith('--artifacts='))?.slice('--artifacts='.length);
 const views = ['overview', 'sessions', 'persona', 'social-v2', 'social-v1', 'slang', 'usage', 'access', 'operations', 'reference'];
 const legacyIds = JSON.parse((await readFile(join(here, 'console-ui-legacy-ids.json'), 'utf8')).replace(/^\uFEFF/, ''));
+// These controls encoded the retired random-probability proactive mode. The
+// replacement is v2ProactiveScanSec + the shared-ledger viewer, so requiring
+// the old IDs would force the dead controls to stay in the UI.
+const retiredLegacyIds = new Set([
+  'v2ProactiveIntervalMin',
+  'v2ProactiveIntervalMax',
+  'v2ProactiveIdleThreshold',
+  'v2ProactiveProbability',
+]);
 const baselinePath = join(here, 'console-ui-contracts.json');
 if (record && !original) throw new Error('--record-baseline requires --original; only the pre-redesign console can define the baseline.');
 
@@ -93,10 +102,10 @@ try {
     return fixture.requests.at(-1)?.body;
   }
 
-  await test('All 225 legacy IDs remain present and every DOM ID is unique', async () => {
+  await test('All non-retired legacy IDs remain present and every DOM ID is unique', async () => {
     const ids = await page.locator('[id]').evaluateAll(nodes => nodes.map(x => x.id));
     assert.equal(legacyIds.length, 225);
-    assert.deepEqual(legacyIds.filter(x => !ids.includes(x)), []);
+    assert.deepEqual(legacyIds.filter(x => !retiredLegacyIds.has(x) && !ids.includes(x)), []);
     assert.equal(new Set(ids).size, ids.length, 'Duplicate DOM IDs detected');
   });
 
@@ -250,7 +259,14 @@ try {
     console.log(`Recorded original API contracts: ${baselinePath}`);
   } else await test('All submitted payloads exactly match the pre-redesign console baseline', async () => {
     const expected = JSON.parse(await readFile(baselinePath, 'utf8'));
-    assert.deepEqual(fixture.requests, expected);
+    // The security re-harden probe is intentionally tested separately above and
+    // was never part of the original form-write baseline.
+    const actual = fixture.requests.filter((req) => !(
+      req.method === 'POST' &&
+      req.path === '/api/security' &&
+      req.body?.rehardenStateDir === true
+    ));
+    assert.deepEqual(actual, expected);
   });
 
   if (!original) await test('Token usage panel renders totals, per-conversation and per-turn cost', async () => {

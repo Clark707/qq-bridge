@@ -29,6 +29,14 @@ for (const { serverName, script } of SERVERS) {
     const names = tools.map((t) => t.name).sort();
     console.log(`✅ ${serverName}: ${names.length} tools`);
     console.log(`   ${names.join(', ')}`);
+    if (serverName === 'snowluma') {
+      for (const required of ['qq_send_voice', 'qq_synthesize_voice', 'qq_list_voices']) {
+        if (!names.includes(required)) {
+          console.log(`   ❌ 缺少语音工具: ${required}`);
+          failures += 1;
+        }
+      }
+    }
     // 校验 DSH 的命名契约：mcp__<serverName>__<rawName>
     const bad = names.filter((n) => !/^[A-Za-z0-9_-]{1,64}$/.test(n));
     if (bad.length) { console.log(`   ⚠️ 不符合 DSH 工具名契约: ${bad.join(', ')}`); failures += 1; }

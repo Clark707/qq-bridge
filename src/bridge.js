@@ -10,24 +10,40 @@ import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
-import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
+import {
+  NodeApiClient,
+  unwrap,
+  createTurnCollector,
+  discoverDshLaunchToken,
+  discoverDshBaseUrl,
+} from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
-import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
-import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
+import { safeFetchBuffer, safeFetchBytes, looksLikeImageBuffer } from './safe-fetch.js';
+import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, resolveFfmpeg, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
+import { extractInboundMediaFromSegments, applyInboundAnnotations, enrichInboundMessage, extractAnimatedImageFrames } from './inbound-media.js';
+import { buildFaceMap, textToQqSegments } from './qq-faces.js';
+import { fetchMemoryEvidence } from './memory-evidence.js';
+import { formatCardMessage } from './link-card.js';
+import { contextTokensFromProjection, summarizeContextPressure } from './context-pressure.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
+import { initiativeRetryDelay, isConcreteInitiativeOpportunity } from './initiative-policy.mjs';
+import { resolveOwnerAgentPreset } from './core/owner-agent-policy.mjs';
+import { isOwnerPrivateKey, ownerActionAllowed } from './core/qq-owner-control.mjs';
+import { evaluateSendBudget } from './core/send-rate-limit.mjs';
+import { mediaProcessFailure } from './core/media-process-error.mjs';
 import {
   loadSlang,
   saveSlang,
@@ -53,11 +69,13 @@ import {
   applyStickerNote,
   markStickerUsed
 } from './sticker-lib.js';
+import { imageMimeFromBuffer, listImageFiles, readImageFile, resolveImageLibraryPath, sanitizeComposeText } from './image-lib.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const STATE_DIR = path.join(ROOT, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
+const RESTART_MARKER_FILE = path.join(STATE_DIR, 'bridge-restarting.json');
 const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
 const SLANG_FILE = path.join(STATE_DIR, 'slang.json');
 const SLANG_SESSION_FILE = path.join(STATE_DIR, 'slang-session.json');
@@ -67,6 +85,9 @@ const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
+const IMAGE_ARTIFACTS_FILE = path.join(STATE_DIR, 'image-artifacts.json');
+const IMAGE_SEND_ANALYTICS_FILE = path.join(STATE_DIR, 'image-sends.jsonl');
+const SNOWLUMA_CATALOG_FILE = path.join(ROOT, '_snowluma-catalog.json');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const TOKEN_USAGE_FILE = path.join(STATE_DIR, 'token-usage.jsonl');
 const ACTIVITY_LOG = path.join(STATE_DIR, 'qq-activity.log');
@@ -673,6 +694,9 @@ function loadConfig() {
     // 空 => 每个会话在 state/agents/<key> 下建独立工作目录
     sessionCwd: file.sessionCwd ?? '',
     agentPreset: file.agentPreset ?? 'qq-chat',
+    // reserved2 的 owner 私聊可使用完整工具 preset；留空保持全部会话受限。
+    ownerAgentPreset: typeof file.ownerAgentPreset === 'string'
+      ? file.ownerAgentPreset.trim() : '',
     workspaceTitle: file.workspaceTitle ?? 'QQ 聊天',
     ownerQQ: normalizeOwnerQQ(file.ownerQQ),
     allow: {
@@ -692,6 +716,23 @@ function loadConfig() {
     consoleToken: file.consoleToken ?? '',
     // 价目表覆盖项（可选）。留空即用 src/model-prices.js 的官方默认价。
     pricing: file.pricing ?? null,
+    memoryRetrieval: {
+      enabled: true,
+      baseUrl: 'http://127.0.0.1:11546',
+      budget: 900,
+      maxChars: 1200,
+      timeoutMs: 2500,
+      ...(file.memoryRetrieval ?? {})
+    },
+    contextManagement: {
+      enabled: true,
+      refreshMs: 60000,
+      warnRatio: 0.3,
+      criticalRatio: 0.38,
+      compactionRatio: 0.4,
+      retainTokens: 64000,
+      ...(file.contextManagement ?? {})
+    },
     security: {
       interceptNotify: true,
       ...(file.security ?? {})
@@ -778,7 +819,9 @@ function loadConfig() {
         setStickerRemark: false,
         stickerNote: true,
         collectSticker: true,
-        getSelfImage: true
+        getSelfImage: true,
+        sendImage: true,
+        scheduleIntention: true
       },
       wake: {
         defaultMode: 'diving',
@@ -840,6 +883,7 @@ function loadConfig() {
       },
       proactive: {
         enabled: true,
+        scanIntervalMs: 60 * 1000,
         checkIntervalMinMs: 30 * 60 * 1000,
         checkIntervalMaxMs: 90 * 60 * 1000,
         idleThresholdMs: 15 * 60 * 1000,
@@ -866,7 +910,23 @@ function loadConfig() {
       media: {
         maxBytes: 8 * 1024 * 1024,
         maxPixels: 64_000_000,
-        maxCount: 5
+        maxCount: 5,
+        imagesDir: 'media/images',
+        pythonPath: 'C:\\Python314\\python.exe',
+        maxComposeSide: 1600,
+        maxComposeTextChars: 200,
+        inbound: {
+          enabled: true,
+          maxBytes: 20 * 1024 * 1024,
+          maxSeconds: 300,
+          maxFrames: 16,
+          modelPath: 'Z:\\Ds工作箱\\工具\\models\\Systran\\faster-whisper-small',
+          ffmpegPath: '',
+          workDir: 'state/inbound-media'
+        }
+      },
+      faces: {
+        enabled: true
       },
       ...(file.socialV2 ?? {})
     }
@@ -904,7 +964,10 @@ function loadConfig() {
     stickerNote: true,
     collectSticker: true,
     getSelfImage: true,
+    sendImage: true,
+    scheduleIntention: true,
     sendVoice: false,
+    ownerActions: false,
     ...(cfg.socialV2.tools ?? {})
   };
 
@@ -962,7 +1025,38 @@ function loadConfig() {
     maxBytes: 8 * 1024 * 1024,
     maxPixels: 64_000_000,
     maxCount: 5,
+    imagesDir: 'media/images',
+    pythonPath: 'C:\\Python314\\python.exe',
+    maxComposeSide: 1600,
+    maxComposeTextChars: 200,
+    inbound: {
+      enabled: true,
+      maxBytes: 20 * 1024 * 1024,
+      maxSeconds: 300,
+      maxFrames: 16,
+      modelPath: 'Z:\\Ds工作箱\\工具\\models\\Systran\\faster-whisper-small',
+      ffmpegPath: '',
+      workDir: 'state/inbound-media'
+    },
     ...((cfg.socialV2?.media && typeof cfg.socialV2.media === 'object' && !Array.isArray(cfg.socialV2.media)) ? cfg.socialV2.media : {})
+  };
+  cfg.socialV2.media.inbound = {
+    enabled: true,
+    maxBytes: 20 * 1024 * 1024,
+    maxSeconds: 300,
+    maxFrames: 16,
+    modelPath: 'Z:\\Ds工作箱\\工具\\models\\Systran\\faster-whisper-small',
+    ffmpegPath: '',
+    workDir: 'state/inbound-media',
+    ...((cfg.socialV2?.media?.inbound && typeof cfg.socialV2.media.inbound === 'object' && !Array.isArray(cfg.socialV2.media.inbound))
+      ? cfg.socialV2.media.inbound
+      : {})
+  };
+  cfg.socialV2.faces = {
+    enabled: true,
+    ...((cfg.socialV2?.faces && typeof cfg.socialV2.faces === 'object' && !Array.isArray(cfg.socialV2.faces))
+      ? cfg.socialV2.faces
+      : {})
   };
 
   // socialV2.initialPromptMaxChars：会话「初始提示词」的字数上限。config.json 是用户可编辑的，
@@ -1273,7 +1367,7 @@ async function segmentsToText(segments, options = {}) {
         out.push(replyText || '[引用消息]');
         break;
       }
-      case 'json': out.push('[卡片消息]'); break;
+      case 'json': out.push(formatCardMessage(d)); break;
       // markdown：SnowLuma 1.14.9 的线上段落是 `{type:'markdown',data:{content}}`。
       // 上游 1.14.17+（commit 1934e4e7「include text alongside received markdown」）
       // 起还会带上 `data.text`。两个形状都读，这样将来升级 SnowLuma 运行时不会退化成
@@ -1346,6 +1440,17 @@ function extractMediaFromSegments(segments) {
         url: String(d.url ?? ''),
         summary: sanitizeMediaSummary(d.summary)
       });
+    } else if (seg.type === 'record' || seg.type === 'video') {
+      const file = String(d.file ?? d.file_id ?? '').trim();
+      const url = String(d.url ?? d.src ?? '').trim();
+      if (file || url) {
+        media.push({
+          kind: seg.type,
+          file,
+          url,
+          durationSec: Number.isFinite(Number(d.duration)) ? Math.max(0, Number(d.duration)) : null
+        });
+      }
     }
   }
   return media;
@@ -1385,6 +1490,7 @@ async function main() {
   hardenStateDirAcl();
   acquireLock();
   loadState();
+  try { fs.rmSync(RESTART_MARKER_FILE, { force: true }); } catch {}
 
   // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
   let slangEntries = [];
@@ -1558,7 +1664,7 @@ async function main() {
     return safeJoinLibrary(vc.dir, rel);
   }
 
-  function resolveVoicePathForV2(input) {
+  function resolveVoicePathForV2(input, { allowOutside = false } = {}) {
     const vc = voiceCfg();
     const raw = String(input ?? '').trim();
     if (!raw) throw new Error('缺少音频：给语音库里的文件名（可用 qq_list_voices 查看）');
@@ -1570,13 +1676,17 @@ async function main() {
     let resolved = null;
     if (isAbs) {
       const r = resolveAudioSource(raw, {});
-      const confined = r.path ? voicePathInsideLibrary(vc, r.path) : null;
+      const confined = allowOutside
+        ? (r.path && fs.existsSync(r.path) && fs.statSync(r.path).isFile() ? r.path : null)
+        : (r.path ? voicePathInsideLibrary(vc, r.path) : null);
       if (confined) {
-        resolved = { path: confined, via: `${r.via}+library-confined` };
+        resolved = { path: confined, via: allowOutside ? `${r.via}+owner` : `${r.via}+library-confined` };
       } else {
         // 只报目录名，不报绝对路径：这条消息会经 MCP 工具错误回给模型，
         // 而模型面对的是不可信的群聊内容（prompt injection 可能诱导它复述本机路径）。
-        throw new Error(`语音只能从语音库取文件（语音库目录：${path.basename(vc.dir)}）；即使是绝对路径也必须位于语音库之内（socialV2.voice.allowAbsolutePath 已不再放宽 AI 通道）。请把音频放进语音库，或用操作者通道（CLI / 控制台）发送库外文件。`);
+        throw new Error(allowOutside
+          ? '找不到该本地音频文件'
+          : `语音只能从语音库取文件（语音库目录：${path.basename(vc.dir)}）；owner 私聊之外不接受库外绝对路径。`);
       }
     } else {
       // ⚠️ 安全关键：相对路径**只能**在语音库内解析。
@@ -1831,10 +1941,10 @@ async function main() {
    * AI 通道入口：解析引用 → 限流 → 发送 → 记账 → 回读校验。
    * 返回 { messageId, detail, verified, readback }。
    */
-  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null } = {}) {
+  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null, allowOutside = false } = {}) {
     const vc = voiceCfg();
     if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
-    const resolved = resolveVoicePathForV2(voiceRef);
+    const resolved = resolveVoicePathForV2(voiceRef, { allowOutside });
     // 音量参数校验前置（AI 传错时给出可读错误，而不是让 ffmpeg 报奇怪的错）
     if (audio) resolveAudioProcessing({ volume: audio.volume ?? vc.defaultVolume, normalize: audio.normalize === true, loudness: audio.loudness ?? vc.loudness });
     voiceBudgetCheck(key, vc);
@@ -1866,6 +1976,11 @@ async function main() {
     // 默认做「回读到 record 段」的落地校验；转写按需（自己发的语音通常没有转写）。
     const wantVerify = verify === true || (verify !== false && vc.autoReadback);
     const verification = wantVerify ? await verifyVoiceMessageSent(sent.messageId) : null;
+    markCapabilityV2(key, 'voice', {
+      verified: verification ? verification.confirmed === true : true,
+      messageId: sent.messageId ?? null,
+      durationSec: Number(verification?.duration) || null
+    });
     return { ...sent, key, file: resolved.path, via: resolved.via, verification, readback: readbackText };
   }
 
@@ -1932,6 +2047,7 @@ async function main() {
           throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
         }
         sendResolve(body.data);
+        void completeActiveInitiativeV2(key, body.data?.message_id ?? null);
       } catch (error) {
         sendReject(error);
       }
@@ -1942,6 +2058,367 @@ async function main() {
     stickerEntries = updated.entries;
     saveStickerStoreSafe();
     return { entry: updated.entry, messageId: data?.message_id ?? null };
+  }
+
+  // ── 本地图片与合成图 ─────────────────────────────────────────────────────
+  // 图片只允许从 media/images 读取。合成图先落盘、再预览、再由 qq_send_image 发送；
+  // 两步之间会留下 artifact，发送回执与自审内容写入 state，不靠聊天上下文记忆。
+  let imageArtifacts = readJsonSafe(IMAGE_ARTIFACTS_FILE, { version: 1, artifacts: {} }, false);
+  if (!imageArtifacts || typeof imageArtifacts !== 'object' || Array.isArray(imageArtifacts)) {
+    imageArtifacts = { version: 1, artifacts: {} };
+  }
+  if (!imageArtifacts.artifacts || typeof imageArtifacts.artifacts !== 'object' || Array.isArray(imageArtifacts.artifacts)) {
+    imageArtifacts.artifacts = {};
+  }
+
+  function imageLibraryDir() {
+    const configured = String(cfg.socialV2?.media?.imagesDir ?? 'media/images').trim() || 'media/images';
+    return path.isAbsolute(configured) ? path.resolve(configured) : path.resolve(ROOT, configured);
+  }
+
+  function saveImageArtifactsSafe() {
+    try {
+      const entries = Object.entries(imageArtifacts.artifacts)
+        .sort((a, b) => Number(b[1]?.createdAt || 0) - Number(a[1]?.createdAt || 0));
+      for (const [id] of entries.slice(300)) delete imageArtifacts.artifacts[id];
+      atomicWriteJson(IMAGE_ARTIFACTS_FILE, imageArtifacts);
+    } catch (error) {
+      log(`保存图片 artifact 索引失败：${error?.message ?? error}`);
+    }
+  }
+
+  function recordImageSendAnalytics(record) {
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      fs.appendFileSync(IMAGE_SEND_ANALYTICS_FILE, JSON.stringify(record) + '\n', 'utf8');
+    } catch (error) {
+      log(`写入图片发送分析失败：${error?.message ?? error}`);
+    }
+  }
+
+  function normalizeImageReview(review) {
+    if (!review || typeof review !== 'object' || Array.isArray(review)) {
+      throw new Error('发送图片前需要自审：请提供 intent（为什么发）和 expected（预期效果）');
+    }
+    const intent = redactKnownTokensOnly(String(review.intent ?? '')).replace(/\s+/g, ' ').trim();
+    const expected = redactKnownTokensOnly(String(review.expected ?? '')).replace(/\s+/g, ' ').trim();
+    if (intent.length < 2 || intent.length > 240) throw new Error('自审 intent 需要 2~240 字');
+    if (expected.length < 2 || expected.length > 240) throw new Error('自审 expected 需要 2~240 字');
+    return {
+      intent,
+      expected,
+      checkedAt: Date.now(),
+      checks: ['recipient-whitelist', 'image-signature', 'size-limit', 'pixel-limit', 'rate-limit']
+    };
+  }
+
+  function oneBotMessageHasImage(message) {
+    if (typeof message === 'string') return /\[CQ:image[,\]]/i.test(message);
+    if (Array.isArray(message)) {
+      return message.some((segment) => String(segment?.type ?? '').toLowerCase() === 'image');
+    }
+    if (message && typeof message === 'object') {
+      if (String(message.type ?? '').toLowerCase() === 'image') return true;
+      return oneBotMessageHasImage(message.message);
+    }
+    return false;
+  }
+
+  async function verifyOneBotMessageSegment(messageId, expectedType) {
+    if (messageId === null || messageId === undefined || messageId === '') {
+      return { verified: false, error: '发送回执没有 message_id' };
+    }
+    try {
+      const response = await bot.request('get_msg', { message_id: Number(messageId) });
+      if (!response || response.status !== 'ok' || response.retcode !== 0) {
+        return { verified: false, error: response?.wording || `get_msg retcode=${response?.retcode ?? 'unknown'}` };
+      }
+      const payload = response.data ?? {};
+      const message = payload.message ?? payload;
+      const verified = expectedType === 'image' ? oneBotMessageHasImage(message) : true;
+      return { verified, error: verified ? null : `回读消息里没有 ${expectedType} 段` };
+    } catch (error) {
+      return { verified: false, error: error?.message ?? String(error) };
+    }
+  }
+
+  function imagePythonPath() {
+    const configured = String(cfg.socialV2?.media?.pythonPath ?? '').trim();
+    if (configured) return configured;
+    return process.env.UTA_PYTHON || (process.platform === 'win32' ? 'C:\\Python314\\python.exe' : 'python3');
+  }
+
+  async function runComposeProcess(args, timeoutMs = 30000, label = '合成图') {
+    return await new Promise((resolve, reject) => {
+      const child = spawn(imagePythonPath(), args, {
+        cwd: ROOT,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      let settled = false;
+      let stdout = '';
+      let stderr = '';
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error);
+        else resolve(value);
+      };
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch {}
+        finish(new Error(`${label}超时（${Math.round(timeoutMs / 1000)} 秒）`));
+      }, timeoutMs);
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk.toString('utf8');
+        if (stdout.length > 256 * 1024) {
+          try { child.kill(); } catch {}
+          finish(new Error(`${label}输出过大`));
+        }
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString('utf8');
+        if (stderr.length > 64 * 1024) stderr = stderr.slice(-64 * 1024);
+      });
+      child.on('error', (error) => finish(new Error(`无法启动${label}进程：${error?.message ?? error}`)));
+      child.on('close', (code) => {
+        if (code !== 0) {
+          finish(new Error(mediaProcessFailure({ label, code, stdout, stderr })));
+          return;
+        }
+        const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
+        let result = null;
+        try { result = JSON.parse(lines.at(-1) ?? ''); } catch {}
+        if (!result?.ok) {
+          finish(new Error(`${label}进程没有返回有效结果：${stdout.trim().slice(-1200) || '空输出'}`));
+          return;
+        }
+        finish(null, result);
+      });
+    });
+  }
+
+  function loadOwnerActionCatalog() {
+    const raw = JSON.parse(fs.readFileSync(SNOWLUMA_CATALOG_FILE, 'utf8'));
+    if (!Array.isArray(raw)) throw new Error('SnowLuma 动作目录格式错误');
+    return new Map(raw
+      .filter((entry) => entry && typeof entry.name === 'string')
+      .map((entry) => [entry.name, entry]));
+  }
+
+  async function generateImageV2(key, options = {}) {
+    const prompt = String(options.prompt ?? '').trim();
+    if (prompt.length < 4) throw new Error('图片提示词太短');
+    const script = path.join(ROOT, '..', 'uta-stack', 'local_media.py');
+    const args = [
+      script, 'image', '--prompt', prompt,
+      '--width', String(options.width ?? 1024),
+      '--height', String(options.height ?? 1536),
+      '--steps', String(options.steps ?? 25),
+      '--timeout-seconds', String(options.timeoutSeconds ?? 1800),
+    ];
+    if (options.seed !== undefined && options.seed !== null && String(options.seed).trim() !== '') {
+      args.push('--seed', String(options.seed));
+    }
+    const result = await runComposeProcess(args, 1_900_000, '本地图片生成');
+    const library = imageLibraryDir();
+    const rel = path.relative(library, path.resolve(String(result.path))).replaceAll('\\', '/');
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error('本地图片生成结果不在图片库内');
+    }
+    let sent = null;
+    if (options.send === true) sent = await sendImageV2(key, rel, {});
+    return { ...result, relativePath: rel, sent };
+  }
+
+  async function synthesizeVoiceV2(key, options = {}) {
+    const text = String(options.text ?? '').trim();
+    if (!text) throw new Error('语音文本不能为空');
+    const script = path.join(ROOT, '..', 'uta-stack', 'local_media.py');
+    const args = [script, 'voice', '--text', text];
+    if (options.speed !== undefined && options.speed !== null) args.push('--speed', String(options.speed));
+    if (options.seed !== undefined && options.seed !== null) args.push('--seed', String(options.seed));
+    const result = await runComposeProcess(args, 950_000, '本地语音合成');
+    let sent = null;
+    if (options.send === true) {
+      sent = await sendVoiceForV2(key, String(result.filename), {
+        label: text.slice(0, 80),
+        verify: true,
+      });
+    }
+    return { ...result, sent };
+  }
+
+  async function composeImageV2(options = {}) {
+    const baseRef = String(options.base ?? '').trim();
+    if (!baseRef) throw new Error('base 不能为空（图片库内相对路径）');
+    const library = imageLibraryDir();
+    const base = readImageFile(library, baseRef, { maxBytes: MAX_MEDIA_BYTES });
+    let overlayPath = null;
+    if (String(options.overlay ?? '').trim()) {
+      overlayPath = readImageFile(library, String(options.overlay), { maxBytes: MAX_MEDIA_BYTES }).path;
+    }
+    const text = sanitizeComposeText(options.text, Math.min(1000, Math.max(20, Number(cfg.socialV2?.media?.maxComposeTextChars) || 200)));
+    const maxSide = Math.min(2400, Math.max(320, Number(options.maxSide) || Number(cfg.socialV2?.media?.maxComposeSide) || 1600));
+    const fontSize = Math.min(128, Math.max(12, Number(options.fontSize) || 48));
+    const position = ['bottom', 'top', 'center'].includes(String(options.position)) ? String(options.position) : 'bottom';
+    const overlayPosition = ['top-left', 'top-right', 'bottom-left', 'bottom-right', 'center'].includes(String(options.overlayPosition))
+      ? String(options.overlayPosition)
+      : 'bottom-right';
+    const overlayScale = Math.min(0.8, Math.max(0.05, Number(options.overlayScale) || 0.28));
+    const artifactId = `img-${Date.now()}-${crypto.randomBytes(5).toString('hex')}`;
+    const outputDir = path.join(library, 'generated');
+    fs.mkdirSync(outputDir, { recursive: true });
+    const outputPath = path.join(outputDir, `${artifactId}.png`);
+    const script = path.join(ROOT, 'scripts', 'compose-image.py');
+    const args = [
+      script,
+      '--base', base.path,
+      '--output', outputPath,
+      '--text', text,
+      '--font-size', String(fontSize),
+      '--max-side', String(maxSide),
+      '--position', position,
+      '--overlay-position', overlayPosition,
+      '--overlay-scale', String(overlayScale)
+    ];
+    if (overlayPath) args.push('--overlay', overlayPath);
+    const processResult = await runComposeProcess(args);
+    const generated = readImageFile(library, path.relative(library, outputPath), { maxBytes: MAX_MEDIA_BYTES });
+    const artifact = {
+      id: artifactId,
+      type: 'composed-image',
+      relativePath: generated.relativePath,
+      name: path.basename(generated.relativePath),
+      bytes: generated.bytes,
+      mimeType: generated.mimeType,
+      sha256: generated.sha256,
+      width: Number(processResult.width) || null,
+      height: Number(processResult.height) || null,
+      base: base.relativePath,
+      overlay: overlayPath ? String(options.overlay) : null,
+      text,
+      createdAt: Date.now(),
+      status: 'review-ready',
+      sent: null
+    };
+    imageArtifacts.artifacts[artifactId] = artifact;
+    saveImageArtifactsSafe();
+    log(`[image] 已生成合成图 ${artifactId}（${artifact.width}x${artifact.height}, ${artifact.bytes} bytes）`);
+    appendActivity(`${options.key ? String(options.key) + ' ' : ''}[image] 生成合成图：${artifact.relativePath}`);
+    return {
+      artifact,
+      preview: { mimeType: generated.mimeType, data: generated.buffer.toString('base64') }
+    };
+  }
+
+  function readOwnerImageFile(input) {
+    const raw = String(input ?? '').trim();
+    if (!raw) throw new Error('图片路径不能为空');
+    if (/^(base64:\/\/|data:|https?:\/\/)/i.test(raw)) throw new Error('owner 图片通道只接受本地文件');
+    const abs = /^file:\/\//i.test(raw) ? fileURLToPath(raw) : path.resolve(raw);
+    const stat = fs.statSync(abs);
+    if (!stat.isFile()) throw new Error('图片路径不是普通文件');
+    if (stat.size <= 0) throw new Error('图片文件为空');
+    if (stat.size > MAX_MEDIA_BYTES) throw new Error(`图片文件超过大小上限（${stat.size} > ${MAX_MEDIA_BYTES} bytes）`);
+    const buffer = fs.readFileSync(abs);
+    const mimeType = imageMimeFromBuffer(buffer);
+    if (!mimeType) throw new Error('文件内容不是有效的 PNG/JPEG/GIF/WebP 图片');
+    return {
+      path: abs,
+      buffer,
+      bytes: buffer.length,
+      mimeType,
+      sha256: crypto.createHash('sha256').update(buffer).digest('hex'),
+      relativePath: path.basename(abs),
+    };
+  }
+
+  async function sendImageV2(key, imageRef, options = {}) {
+    const assertSendAllowed = captureSendGuard(key);
+    const review = normalizeImageReview(options.review);
+    const library = imageLibraryDir();
+    const image = options.allowOutside
+      ? readOwnerImageFile(imageRef)
+      : readImageFile(library, imageRef, { maxBytes: MAX_MEDIA_BYTES });
+    const [kind, id] = key.split(':');
+    const segments = [];
+    if (options.replyToMessageId !== undefined && options.replyToMessageId !== null && String(options.replyToMessageId).trim() !== '') {
+      const rid = String(options.replyToMessageId).trim();
+      if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
+      segments.push({ type: 'reply', data: { id: rid } });
+    }
+    if (options.atUserId !== undefined && options.atUserId !== null && String(options.atUserId).trim() !== '') {
+      const at = String(options.atUserId).trim();
+      if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
+      segments.push({ type: 'at', data: { qq: at } });
+    }
+    segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
+    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+    const params = kind === 'private'
+      ? { user_id: Number(id), message: segments }
+      : { group_id: Number(id), message: segments };
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    let sendResolve;
+    let sendReject;
+    const sendResult = new Promise((resolve, reject) => {
+      sendResolve = resolve;
+      sendReject = reject;
+    });
+    sendChain = sendChain.then(async () => {
+      try {
+        await sleep(randInt(700, 1800));
+        assertSendAllowed();
+        const res = await fetch(`${httpUrl}/${action}`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+          },
+          body: JSON.stringify(params),
+          signal: AbortSignal.timeout(30000)
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+          throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}`);
+        }
+        sendResolve(body.data);
+        void completeActiveInitiativeV2(key, body.data?.message_id ?? null);
+      } catch (error) {
+        sendReject(error);
+      }
+    });
+    const data = await sendResult;
+    const messageId = data?.message_id ?? null;
+    const verification = await verifyOneBotMessageSegment(messageId, 'image');
+    const artifactEntry = Object.values(imageArtifacts.artifacts)
+      .find((item) => item?.relativePath === image.relativePath) || null;
+    if (artifactEntry) {
+      artifactEntry.status = verification.verified ? 'sent-verified' : 'sent-unverified';
+      artifactEntry.sent = { messageId, at: Date.now(), review, verification };
+      saveImageArtifactsSafe();
+    }
+    recordImageSendAnalytics({
+      ts: new Date().toISOString(),
+      key,
+      image: image.relativePath,
+      sha256: image.sha256,
+      bytes: image.bytes,
+      messageId,
+      review,
+      verification
+    });
+    return {
+      image: image.relativePath,
+      name: path.basename(image.relativePath),
+      mimeType: image.mimeType,
+      bytes: image.bytes,
+      sha256: image.sha256,
+      messageId,
+      verified: verification.verified,
+      verificationError: verification.error,
+      review
+    };
   }
 
   // 更新本地 AI 认知（含义/标签/用法）。
@@ -2325,7 +2802,16 @@ async function main() {
     log('ℹ️  socialV2.voice.allowAbsolutePath=true 已不再放宽 AI 通道：AI 发的语音始终只允许来自语音库（库外文件请用语音工具/CLI 发送）');
   }
 
-  // DSH 侧
+  // DSH 侧。desktop 壳的 API 端口每次启动动态分配；先按鉴权 RPC 找到当前宿主，
+  // 找不到才保留配置里的候选地址，由 checkDsh 继续重试。
+  const initialDsh = await discoverDshBaseUrl({
+    preferredBaseUrl: cfg.dsh.baseUrl,
+    timeoutMs: 1800,
+  });
+  if (initialDsh && initialDsh.baseUrl !== cfg.dsh.baseUrl) {
+    log(`DSH API 已自动发现：${cfg.dsh.baseUrl} → ${initialDsh.baseUrl}`);
+    cfg.dsh.baseUrl = initialDsh.baseUrl;
+  }
   const api = new NodeApiClient(cfg.dsh.baseUrl, undefined, {
     token: cfg.dsh.authToken,
     // true=用户在 config.json 里显式填的；false=从日志猜的。猜来的不优先于离线铸造。
@@ -2353,6 +2839,9 @@ async function main() {
   }
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
+  const turnInputBySession = new Map(); // sessionId -> 本轮真正呈现给模型的消息文本
+  const turnOutboundBySession = new Map(); // sessionId -> 本轮成功经由 QQ 工具发出的文字
+  const outboundTextByCallId = new Map(); // callId -> 该发送工具调用的文字
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
@@ -2403,7 +2892,83 @@ async function main() {
 
   /** sessionId -> 最近一次已知的实际模型。切换模型会让单价差好几倍，所以按会话记。 */
   const sessionModels = new Map();
+  /** sessionId -> 最近一次上下文压力投影（只读观测，不接管 DSH 的压缩器）。 */
+  const sessionContextPressure = new Map();
   const nominalModel = () => cfg.dsh?.model || 'deepseek-flash';
+
+  function contextPolicy() {
+    const c = cfg.contextManagement ?? {};
+    return {
+      enabled: c.enabled !== false,
+      refreshMs: Math.max(5000, Number(c.refreshMs) || 60000),
+      warnRatio: Math.min(0.8, Math.max(0.1, Number(c.warnRatio) || 0.3)),
+      criticalRatio: Math.min(0.95, Math.max(0.2, Number(c.criticalRatio) || 0.38)),
+      compactionRatio: Math.min(0.98, Math.max(0.2, Number(c.compactionRatio) || 0.4)),
+      retainTokens: Math.max(0, Number(c.retainTokens) || 64000)
+    };
+  }
+
+  function rememberContextPressure(sessionId, pressure, breakdown = null) {
+    if (!sessionId || !pressure || typeof pressure !== 'object') return;
+    const policy = contextPolicy();
+    // 开场快照用 surfaceTokens；现役 session/projections 用 pressureTokens/projectedTokens。
+    // 两种都是 DSH 的同一预算投影，只是字段代次不同。漏掉后者会把临界状态误报成 unknown。
+    const effectiveTokens = contextTokensFromProjection(pressure);
+    const summary = summarizeContextPressure({
+      surfaceTokens: effectiveTokens,
+      contextWindow: pressure.contextWindow,
+      warnRatio: policy.warnRatio,
+      criticalRatio: policy.criticalRatio,
+      compactionRatio: policy.compactionRatio,
+      retainTokens: policy.retainTokens
+    });
+    const previous = sessionContextPressure.get(sessionId);
+    const next = {
+      ...summary,
+      pressureTokens: Number(pressure.pressureTokens) || null,
+      sampledSurfaceTokens: Number(pressure.sampledSurfaceTokens) || null,
+      breakdown: breakdown && typeof breakdown === 'object' ? breakdown : previous?.breakdown ?? null,
+      checkedAt: Date.now()
+    };
+    sessionContextPressure.set(sessionId, next);
+    if (next.level !== 'ok' && next.level !== 'unknown' && next.level !== previous?.level) {
+      const lvl = next.level === 'overflow' ? '报警' : '提醒';
+      log(`[context] ${sessionId} ${lvl}：${next.text}`);
+    } else if (next.level === 'ok' && ['critical', 'compacting', 'overflow'].includes(previous?.level)) {
+      log(`[context] ${sessionId} 压缩后恢复：${next.text}`);
+    }
+  }
+
+  async function refreshSessionContext(sessionId, { force = false } = {}) {
+    const policy = contextPolicy();
+    if (!policy.enabled || !sessionId) return sessionContextPressure.get(sessionId) ?? null;
+    const previous = sessionContextPressure.get(sessionId);
+    if (!force && previous && Date.now() - Number(previous.checkedAt || 0) < policy.refreshMs) return previous;
+    try {
+      const response = await withTimeout(
+        api.callUnary('session/projections', { sessionId }),
+        DSH_CONTROL_TIMEOUT_MS,
+        'session/projections(context)'
+      );
+      if (response?.result?.ok) {
+        const values = response.result.value?.values ?? null;
+        if (values?.contextPressure) {
+          rememberContextPressure(sessionId, values.contextPressure, values.contextBreakdown?.breakdown ?? values.contextBreakdown ?? null);
+        }
+      }
+    } catch (error) {
+      if (!previous?.lastError || Date.now() - Number(previous.lastErrorAt || 0) > 10 * 60 * 1000) {
+        log(`[context] 读取 ${sessionId} 上下文压力失败：${error?.message ?? error}`);
+      }
+      sessionContextPressure.set(sessionId, {
+        ...(previous ?? summarizeContextPressure({})),
+        lastError: String(error?.message ?? error),
+        lastErrorAt: Date.now(),
+        checkedAt: previous?.checkedAt ?? 0
+      });
+    }
+    return sessionContextPressure.get(sessionId) ?? null;
+  }
 
   function rememberModel(sessionId, selection) {
     const model = selection?.model;
@@ -2439,6 +3004,12 @@ async function main() {
       if (!snapshot) return;
       const selection = snapshot.projections?.values?.modelSelection;
       rememberModel(sessionId, selection?.lastUsed ?? selection?.pending ?? null);
+      const contextValues = snapshot.projections?.values ?? {};
+      rememberContextPressure(
+        sessionId,
+        contextValues.contextPressure,
+        contextValues.contextBreakdown?.breakdown ?? contextValues.contextBreakdown ?? null
+      );
       const known = sessionModels.get(sessionId);
       tokenLedger.ingestBaseline({
         sessionId,
@@ -2662,9 +3233,19 @@ async function main() {
       if (!chosen) log('⚠️ 无法确定 closed-agent 的 preset（DSH preset 清单未知），将按 DSH 默认 preset 建会话');
       return chosen || undefined;
     }
-    // 二代仿真模式优先使用 socialV2.agentPreset；未配置时回退到默认聊天预设。
+    // 二代仿真模式优先使用 socialV2.agentPreset；只有 owner 私聊可切到
+    // ownerAgentPreset（完整工具面），群聊和其他私聊仍保持受限 preset。
     // 非 closed-agent 一律 strict：宁可建不出会话，也不给群聊套上带本地工具的默认 preset。
-    const wanted = mode === 'reserved2' ? (cfg.socialV2?.agentPreset || cfg.agentPreset) : cfg.agentPreset;
+    const simulationPreset = cfg.socialV2?.agentPreset || cfg.agentPreset;
+    const wanted = mode === 'reserved2'
+      ? resolveOwnerAgentPreset({
+        key,
+        ownerQQ: cfg.ownerQQ,
+        mode,
+        ownerAgentPreset: cfg.ownerAgentPreset,
+        simulationPreset,
+      })
+      : cfg.agentPreset;
     return resolvePresetName(wanted, { strict: true }) || undefined;
   }
 
@@ -2732,6 +3313,8 @@ async function main() {
     sessionModels.delete(sessionId);
     modelAppliedSessions.delete(sessionId);
     sendToolSucceededSessions.delete(sessionId);
+    turnInputBySession.delete(sessionId);
+    turnOutboundBySession.delete(sessionId);
     pendingSendToolCalls.delete(sessionId);
     v2TurnStartAt.delete(sessionId);
     turnLeaseNoted.delete(sessionId);
@@ -2847,12 +3430,34 @@ async function main() {
       }
     }
   };
+  let lastDshDiscoveryAt = 0;
   const checkDsh = async () => {
     let ok = false;
     try {
       await api.settings.describe({});
       ok = true;
     } catch {}
+    // 端口会随 desktop 壳重启而变化。失败后按进程归属重新发现，而不是等用户
+    // 手工改 config.json；节流避免每 5 秒都拉起一次系统查询。
+    if (!ok && Date.now() - lastDshDiscoveryAt >= 15000) {
+      lastDshDiscoveryAt = Date.now();
+      try {
+        const found = await discoverDshBaseUrl({
+          preferredBaseUrl: cfg.dsh.baseUrl,
+          timeoutMs: 1800,
+        });
+        if (found && found.baseUrl !== api.baseUrl) {
+          const previous = api.baseUrl;
+          api.setBaseUrl(found.baseUrl);
+          cfg.dsh.baseUrl = found.baseUrl;
+          log(`DSH API 地址已切换：${previous} → ${found.baseUrl}`);
+        }
+        if (found) {
+          await api.settings.describe({});
+          ok = true;
+        }
+      } catch {}
+    }
     if (ok) {
       await refreshMode();
       // DSH 起来后拉一次 preset 清单；DSH 重启（dshReady 由 false 变 true）时再拉一次。
@@ -3009,6 +3614,126 @@ async function main() {
       degraded: confirmed || silent,
       hint,
     };
+  }
+
+  // ── Shared initiative ledger（LAAP /v1/initiative/*）──────────────────────
+  // QQ 与飞书共用同一份主动意图账本。这里不再掷骰子决定是否冒泡，
+  // 只做三件事：领取一个具体机会、唤醒她、真正发出后写回执。
+  function initiativeApiBase() {
+    return String(process.env.UTA_INITIATIVE_API || 'http://127.0.0.1:11546').replace(/\/+$/, '');
+  }
+
+  async function initiativeApi(pathname, body, timeoutMs = 8000) {
+    const res = await fetch(`${initiativeApiBase()}${pathname}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data?.ok === false) {
+      throw new Error(data?.error || `initiative API HTTP ${res.status}`);
+    }
+    return data;
+  }
+
+  async function initiativeStatusV2(target = '', timeoutMs = 8000) {
+    const query = new URLSearchParams({ channel: 'qq' });
+    if (target) query.set('target', target);
+    const res = await fetch(
+      `${initiativeApiBase()}/v1/initiative/status?${query.toString()}`,
+      { signal: AbortSignal.timeout(timeoutMs) }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data?.ok === false) {
+      throw new Error(data?.error || `initiative API HTTP ${res.status}`);
+    }
+    return data;
+  }
+
+  async function claimInitiativeV2(key, st, event = 'idle_check') {
+    const idleSeconds = st.lastIncomingAt
+      ? Math.max(0, Math.floor((Date.now() - Number(st.lastIncomingAt)) / 1000))
+      : 86400;
+    return initiativeApi('/v1/initiative/claim', {
+      channel: 'qq',
+      target: key,
+      session_id: state.sessions[key] || '',
+      owner_private: isOwnerPrivateKey(key, cfg.ownerQQ),
+      event,
+      online: snowlumaHealth.connected && snowlumaHealth.accountOnline && snowlumaHealth.good !== false,
+      context: {
+        idle_seconds: idleSeconds,
+        unread_count: Array.isArray(st.unread) ? st.unread.length : 0,
+        last_ai_reply_at: Number(st.lastAiReplyAt) || 0,
+        pending_thoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts : []
+      }
+    });
+  }
+
+  async function completeActiveInitiativeV2(key, messageId) {
+    const st = socialV2.conversations.get(key);
+    const active = st?.initiativeClaim;
+    if (!active?.id || !active?.claim_token) return false;
+    st.initiativeClaim = null;
+    try {
+      await initiativeApi('/v1/initiative/ack', {
+        id: active.id,
+        claim_token: active.claim_token,
+        status: 'sent',
+        message_id: messageId == null ? '' : String(messageId),
+        outcome: 'QQ message sent'
+      });
+      log(`[initiative] QQ 已回执 ${key}: ${active.id} messageId=${messageId ?? '?'}`);
+      return true;
+    } catch (error) {
+      log(`[initiative] QQ 回执失败 ${key}: ${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  async function skipActiveInitiativeV2(key, outcome = 'agent chose not to send') {
+    const st = socialV2.conversations.get(key);
+    const active = st?.initiativeClaim;
+    if (!active?.id || !active?.claim_token) return false;
+    st.initiativeClaim = null;
+    try {
+      await initiativeApi('/v1/initiative/ack', {
+        id: active.id,
+        claim_token: active.claim_token,
+        status: 'skipped',
+        outcome
+      });
+      log(`[initiative] QQ 机会 ${active.id} 已跳过：${outcome}`);
+      return true;
+    } catch (error) {
+      log(`[initiative] QQ 跳过回执失败 ${key}: ${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  async function noteInitiativeFeedbackV2(key, kind) {
+    try {
+      await initiativeApi('/v1/initiative/feedback', { channel: 'qq', target: key, kind });
+    } catch (error) {
+      log(`[initiative] QQ 反馈记账失败 ${key}: ${error?.message ?? error}`);
+    }
+  }
+
+  async function scheduleIntentionV2(key, body = {}) {
+    const reason = String(body.reason ?? '').trim();
+    if (!reason) throw new Error('主动意图必须写清 reason');
+    return initiativeApi('/v1/initiative/create', {
+      channel: 'qq',
+      target: key,
+      session_id: state.sessions[key] || '',
+      reason,
+      content_hint: String(body.contentHint ?? body.content_hint ?? '').trim(),
+      due_at: body.dueAt ?? body.due_at,
+      expires_at: body.expiresAt ?? body.expires_at,
+      source: 'qq-agent',
+      source_ref: String(body.sourceRef ?? body.source_ref ?? '').trim()
+    });
   }
 
   /** 边沿触发地告警/恢复，避免每轮探测都刷一行日志。 */
@@ -3318,7 +4043,7 @@ async function main() {
         // 管理端专用 v2 接口：带 agent token 的请求一律拒绝，防止 MCP 工具越权访问控制台功能
         // /api/socialV2/initial-prompt 也在这里：它是操作者写给 AI 的"环境背景"，
         // 让 AI 自己读/改等于把控制台的管理输入（以及未来可能写入的其它群信息）交给会话主体。
-        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt'];
+        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/initiative', '/api/socialV2/wake', '/api/socialV2/initial-prompt'];
         if (req.headers['x-agent-token'] && (adminOnlyV2Paths.includes(url.pathname) || (url.pathname === '/api/socialV2/feedback' && req.method === 'GET') || (url.pathname === '/api/socialV2/tool-log' && req.method === 'GET'))) {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
@@ -3392,9 +4117,11 @@ async function main() {
             });
             return;
           }
+          await Promise.allSettled(Object.values(state.sessions).map((sessionId) => refreshSessionContext(sessionId)));
           sendJson({
             mode: currentMode,
             closedAgentPreset,
+            ownerAgentPreset: cfg.ownerAgentPreset || null,
             role: rs.role ?? null,
             roleMode: rs.mode ?? 'active',
             dshReady,
@@ -3402,6 +4129,13 @@ async function main() {
             allowGroups: cfg.allow?.groups ?? [],
             allowPrivate: cfg.allow?.private ?? [],
             socialV2Paused: socialV2.paused,
+            context: {
+              policy: contextPolicy(),
+              sessions: Object.fromEntries(Object.entries(state.sessions).map(([key, sessionId]) => [
+                key,
+                sessionContextPressure.get(sessionId) ?? null
+              ]))
+            },
             // 上游健康只给操作者看：它包含网关诊断信息（good/hint），
             // 属于管理侧观测，不该进 QQ 会话里那个受限的智能体视图。
             snowluma: snowlumaHealthSnapshot(),
@@ -4185,10 +4919,11 @@ async function main() {
           if (!allowed(kind, id, cfg)) { sendJson({ ok: false, error: `目标不在白名单内（${kind} ${id}），请先加入白名单` }, 403); return; }
           if (!modeAllowed(`${kind}:${id}`, kind, id, cfg, currentMode)) { sendJson({ ok: false, error: `当前模式（${currentMode}）不允许向 ${kind}:${id} 发送测试消息` }, 403); return; }
           try {
-            const safeMessage = escapeCqText(redactKnownTokensOnly(message));
+            const safeMessage = redactKnownTokensOnly(message);
+            const outboundSegments = await qqMessageForText(safeMessage);
             const result = kind === 'private'
-              ? await bot.sendPrivateMessage(id, text(safeMessage))
-              : await bot.sendGroupMessage(id, text(safeMessage));
+              ? await bot.sendPrivateMessage(id, outboundSegments)
+              : await bot.sendGroupMessage(id, outboundSegments);
             log(`控制台：测试发送 ${kind}:${id} 成功`);
             sendJson({ ok: true, kind, id, message_id: result?.message_id ?? result });
           } catch (error) {
@@ -4384,7 +5119,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendImage', 'scheduleIntention', 'sendVoice', 'ownerActions'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4440,7 +5175,7 @@ async function main() {
           // proactive：主动机会参数
           if (body.proactive && typeof body.proactive === 'object') {
             merged.proactive = { ...(current.proactive ?? {}), ...body.proactive };
-            for (const k of ['checkIntervalMinMs', 'checkIntervalMaxMs', 'idleThresholdMs', 'probability']) {
+          for (const k of ['scanIntervalMs', 'checkIntervalMinMs', 'checkIntervalMaxMs', 'idleThresholdMs', 'probability']) {
               if (merged.proactive[k] !== undefined) {
                 const n = Number(merged.proactive[k]);
                 merged.proactive[k] = Number.isFinite(n) ? n : current.proactive?.[k] ?? 0;
@@ -4585,6 +5320,15 @@ async function main() {
           sendJson({ ok: true });
           return;
         }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/initiative') {
+          const target = String(url.searchParams.get('key') ?? '').trim();
+          try {
+            sendJson(await initiativeStatusV2(target));
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 503);
+          }
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/state') {
           const key = String(url.searchParams.get('key') ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
@@ -4646,7 +5390,10 @@ async function main() {
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
             getSelfImage: 'qq_get_self_image',
-            sendVoice: 'qq_send_voice / qq_list_voices'
+            sendImage: 'qq_list_images / qq_compose_image / qq_send_image',
+            scheduleIntention: 'qq_schedule_intention',
+            sendVoice: 'qq_send_voice / qq_list_voices / qq_synthesize_voice',
+            ownerActions: 'qq_owner_action / qq_owner_list_actions'
           };
           const tools = cfg.socialV2?.tools ?? {};
           const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
@@ -4942,6 +5689,71 @@ async function main() {
           sendJson({ ok: true, conversations: list });
           return;
         }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/owner-actions') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          const token = String(req.headers['x-agent-token'] ?? '').trim();
+          if (!isOwnerPrivateKey(key, cfg.ownerQQ)) {
+            sendJson({ ok: false, error: '完整 QQ 控制只允许 owner 私聊' }, 403);
+            return;
+          }
+          if (!agentTokenOk(key, token) || !v2SessionAllowed(key)) {
+            sendJson({ ok: false, error: '会话令牌或会话范围无效' }, 403);
+            return;
+          }
+          if (currentMode !== 'reserved2' || !v2ToolEnabled('ownerActions')) {
+            sendJson({ ok: false, error: '完整 QQ 控制未启用' }, 403);
+            return;
+          }
+          try {
+            const q = String(url.searchParams.get('q') ?? '').trim().toLowerCase();
+            const actions = [...loadOwnerActionCatalog().values()]
+              .filter((entry) => !q || entry.name.toLowerCase().includes(q) || String(entry.summary ?? '').toLowerCase().includes(q))
+              .map((entry) => ({ name: entry.name, summary: entry.summary ?? '', readOnly: entry.readOnly === true, params: entry.params ?? [] }));
+            sendJson({ ok: true, actions });
+          } catch (error) {
+            sendJson({ ok: false, error: `读取 SnowLuma 动作目录失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/owner-action') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const token = String(req.headers['x-agent-token'] ?? '').trim();
+          const action = String(body.action ?? '').trim();
+          const params = body.params && typeof body.params === 'object' && !Array.isArray(body.params) ? body.params : {};
+          if (!isOwnerPrivateKey(key, cfg.ownerQQ)) {
+            sendJson({ ok: false, error: '完整 QQ 控制只允许 owner 私聊' }, 403);
+            return;
+          }
+          if (!agentTokenOk(key, token) || !v2SessionAllowed(key)) {
+            sendJson({ ok: false, error: '会话令牌或会话范围无效' }, 403);
+            return;
+          }
+          if (currentMode !== 'reserved2' || !v2ToolEnabled('ownerActions')) {
+            sendJson({ ok: false, error: '完整 QQ 控制未启用' }, 403);
+            return;
+          }
+          try {
+            const catalog = loadOwnerActionCatalog();
+            if (!ownerActionAllowed(action, catalog)) {
+              sendJson({ ok: false, error: `动作不可用或不走完整控制通道：${action}` }, 403);
+              return;
+            }
+            const response = await bot.request(action, params);
+            if (!response || response.status !== 'ok' || response.retcode !== 0) {
+              sendJson({ ok: false, error: response?.wording || `SnowLuma retcode=${response?.retcode ?? 'unknown'}` }, 502);
+              return;
+            }
+            if (action === 'set_qq_profile' && typeof params.nickname === 'string' && params.nickname.trim()) {
+              selfDisplayName = params.nickname.trim();
+              selfNickname = selfDisplayName.toLowerCase();
+            }
+            sendJson({ ok: true, action, result: response.data ?? null });
+          } catch (error) {
+            sendJson({ ok: false, error: `QQ 动作失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/wake') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
@@ -5089,6 +5901,10 @@ async function main() {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
+          if (kind === 'group' && req.headers['x-agent-token'] && !groupSendScopeAllowedV2(key)) {
+            sendJson({ ok: false, error: '群目标没有绑定当前对话或明确指令：请在 owner 私聊里写出群号，或等群会话自己收到消息后再发' }, 403);
+            return;
+          }
           if (shouldBlockSilentReply(key)) {
             sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403);
             return;
@@ -5113,12 +5929,21 @@ async function main() {
           const st = getSocialV2State(key);
           const now = Date.now();
           try {
-            const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
-            const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + messages.length > maxPerMinute) || (maxPerHour > 0 && recentHour + messages.length > maxPerHour)) {
-              sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
+            const budget = evaluateSendBudget({
+              sendTimes: st.sendTimes,
+              now,
+              perMinute: sendCfg.maxSendPerMinute,
+              perHour: sendCfg.maxSendPerHour,
+              incoming: messages.length,
+            });
+            if (budget.blocked) {
+              const seconds = Math.max(1, Math.ceil(budget.retryAfterMs / 1000));
+              sendJson({
+                ok: false,
+                error: `发送频率超限（${budget.scope === 'hour' ? '小时' : '分钟'}额度 ${budget.used}/${budget.limit}），约 ${seconds} 秒后可继续；不要连续重试`,
+                limitScope: budget.scope,
+                retryAfterMs: budget.retryAfterMs,
+              }, 429);
               return;
             }
             // 先预占发送额度，避免并发绕过限频
@@ -5212,6 +6037,10 @@ async function main() {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
+          if (kind === 'group' && req.headers['x-agent-token'] && !groupSendScopeAllowedV2(key)) {
+            sendJson({ ok: false, error: '群目标没有绑定当前对话或明确指令：请在 owner 私聊里写出群号，或等群会话自己收到消息后再发' }, 403);
+            return;
+          }
           if (kind === 'private' && atUserId) {
             sendJson({ ok: false, error: '私聊不需要 @' }, 400);
             return;
@@ -5245,12 +6074,21 @@ async function main() {
           // 先做发送频率检查并预占额度，再解析引用目标，避免未限流的引用查询打爆 OneBot。
           const st = getSocialV2State(key);
           const now = Date.now();
-          const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
-          const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-          const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-          const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-          if ((maxPerMinute > 0 && recentMinute + messages.length > maxPerMinute) || (maxPerHour > 0 && recentHour + messages.length > maxPerHour)) {
-            sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
+          const budget = evaluateSendBudget({
+            sendTimes: st.sendTimes,
+            now,
+            perMinute: sendCfg.maxSendPerMinute,
+            perHour: sendCfg.maxSendPerHour,
+            incoming: messages.length,
+          });
+          if (budget.blocked) {
+            const seconds = Math.max(1, Math.ceil(budget.retryAfterMs / 1000));
+            sendJson({
+              ok: false,
+              error: `发送频率超限（${budget.scope === 'hour' ? '小时' : '分钟'}额度 ${budget.used}/${budget.limit}），约 ${seconds} 秒后可继续；不要连续重试`,
+              limitScope: budget.scope,
+              retryAfterMs: budget.retryAfterMs,
+            }, 429);
             return;
           }
           // 先预占发送额度，避免并发绕过限频
@@ -5276,6 +6114,10 @@ async function main() {
           try {
             const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages);
+            if (isOwnerPrivateKey(key, cfg.ownerQQ)) {
+              const through = readThroughSeqV2(st);
+              if (through > 0) acknowledgeMessagesV2(st, through);
+            }
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -5322,6 +6164,10 @@ async function main() {
           const id = Number(keyMatch[2]);
           if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '当前模式不允许操作该会话' }, 403);
+            return;
+          }
+          if (kind === 'group' && !groupSendScopeAllowedV2(key)) {
+            sendJson({ ok: false, error: '群目标没有绑定当前对话或明确指令：请在 owner 私聊里写出群号，或等群会话自己收到消息后再发' }, 403);
             return;
           }
           if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许拍一拍' }, 403); return; }
@@ -5620,6 +6466,7 @@ async function main() {
           const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
           const key = String(body.key ?? body.target ?? '').trim();
           const voice = voiceCfg();
+          const ownerKey = isOwnerPrivateKey(key, cfg.ownerQQ);
           if (!voice.enabled) { sendJson({ ok: false, error: '语音功能已关闭' }, 403); return; }
           if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
@@ -5636,10 +6483,14 @@ async function main() {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
+          if (kind === 'group' && !groupSendScopeAllowedV2(key)) {
+            sendJson({ ok: false, error: '群目标没有绑定当前对话或明确指令：请在 owner 私聊里写出群号，或等群会话自己收到消息后再发' }, 403);
+            return;
+          }
           // 只要名字（解析）不要内容（预览）：dry-run 也必须经过与真发相同的解析与校验。
           let resolved;
           try {
-            resolved = resolveVoicePathForV2(body.voice ?? body.file ?? '');
+            resolved = resolveVoicePathForV2(body.voice ?? body.file ?? '', { allowOutside: ownerKey });
           } catch (error) {
             sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
             return;
@@ -5656,6 +6507,7 @@ async function main() {
               label: body.label ? String(body.label).slice(0, 100) : '',
               verify: body.verify,
               readback: body.readback === true,
+              allowOutside: ownerKey,
               // AI 也可以调音量（默认走 config 的 defaultVolume）
               audio: (body.volume !== undefined || body.normalize === true || body.loudness !== undefined)
                 ? { volume: body.volume, normalize: body.normalize === true, loudness: body.loudness }
@@ -5676,6 +6528,31 @@ async function main() {
           } catch (error) {
             // 额度只在真正发出后才记账（voiceBudgetCommit），所以失败路径无需回滚。
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/synthesize-voice') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (!isOwnerPrivateKey(key, cfg.ownerQQ)) {
+            sendJson({ ok: false, error: '本地语音合成只允许 owner 私聊' }, 403);
+            return;
+          }
+          if (!agentTokenOk(key, token) || !v2SessionAllowed(key) || currentMode !== 'reserved2' || !v2ToolEnabled('sendVoice')) {
+            sendJson({ ok: false, error: '会话令牌或语音工具未启用' }, 403);
+            return;
+          }
+          try {
+            const result = await synthesizeVoiceV2(key, {
+              text: body.text,
+              speed: body.speed,
+              seed: body.seed,
+              send: body.send === true,
+            });
+            sendJson({ ok: true, key, ...result });
+          } catch (error) {
+            sendJson({ ok: false, error: `本地语音合成失败：${error?.message ?? error}` }, 500);
           }
           return;
         }
@@ -5705,6 +6582,10 @@ async function main() {
           const id = Number(keyMatch[2]);
           if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          if (kind === 'group' && req.headers['x-agent-token'] && !groupSendScopeAllowedV2(key)) {
+            sendJson({ ok: false, error: '群目标没有绑定当前对话或明确指令：请在 owner 私聊里写出群号，或等群会话自己收到消息后再发' }, 403);
             return;
           }
           if (kind === 'private' && atUserId) { sendJson({ ok: false, error: '私聊不需要 @' }, 400); return; }
@@ -5783,6 +6664,243 @@ async function main() {
             saveSocialV2State();
             log(`[sticker] 工具发送表情失败 ${key}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `发送表情失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/images') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 100));
+          const agentCall = Boolean(req.headers['x-agent-token']);
+          if (agentCall) {
+            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+            if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            if (!v2ToolEnabled('sendImage')) { sendJson({ ok: false, error: '工具未启用：qq_send_image' }, 403); return; }
+          }
+          try {
+            const images = listImageFiles(imageLibraryDir(), { limit }).map((item) => ({
+              path: item.relativePath,
+              name: item.name,
+              bytes: item.bytes,
+              updatedAt: item.updatedAt
+            }));
+            sendJson({ ok: true, key: key || null, images, count: images.length, library: 'media/images' });
+          } catch (error) {
+            sendJson({ ok: false, error: `读取图片库失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/compose-image') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式合成图片必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (!v2ToolEnabled('sendImage')) { sendJson({ ok: false, error: '工具未启用：qq_compose_image' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch || !modeAllowed(key, keyMatch[1], Number(keyMatch[2]), cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          try {
+            const result = await composeImageV2({
+              key,
+              base: body.base,
+              overlay: body.overlay,
+              text: body.text,
+              position: body.position,
+              overlayPosition: body.overlayPosition,
+              overlayScale: body.overlayScale,
+              fontSize: body.fontSize,
+              maxSide: body.maxSide
+            });
+            sendJson({ ok: true, key, artifact: result.artifact, image: result.preview });
+          } catch (error) {
+            log(`[image] 合成图片失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `合成图片失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/generate-image') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const token = String(req.headers['x-agent-token'] ?? '').trim();
+          if (!isOwnerPrivateKey(key, cfg.ownerQQ)) {
+            sendJson({ ok: false, error: '本地图片生成只允许 owner 私聊' }, 403);
+            return;
+          }
+          if (!agentTokenOk(key, token) || !v2SessionAllowed(key) || currentMode !== 'reserved2' || !v2ToolEnabled('sendImage')) {
+            sendJson({ ok: false, error: '会话令牌或工具权限无效' }, 403);
+            return;
+          }
+          try {
+            const result = await generateImageV2(key, {
+              prompt: body.prompt,
+              width: body.width,
+              height: body.height,
+              steps: body.steps,
+              seed: body.seed,
+              timeoutSeconds: body.timeoutSeconds,
+              send: body.send === true,
+            });
+            sendJson({ ok: true, ...result });
+          } catch (error) {
+            sendJson({ ok: false, error: `本地图片生成失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-image') {
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const image = String(body.image ?? '').trim();
+          const ownerKey = isOwnerPrivateKey(key, cfg.ownerQQ);
+          if (!key || !image) { sendJson({ ok: false, error: 'key 和 image 不能为空' }, 400); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送图片必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (!v2ToolEnabled('sendImage')) { sendJson({ ok: false, error: '工具未启用：qq_send_image' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch || !modeAllowed(key, keyMatch[1], Number(keyMatch[2]), cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          if (keyMatch[1] === 'group' && !groupSendScopeAllowedV2(key)) {
+            sendJson({ ok: false, error: '群目标没有绑定当前对话或明确指令：请在 owner 私聊里写出群号，或等群会话自己收到消息后再发' }, 403);
+            return;
+          }
+          if (keyMatch[1] === 'private' && body.atUserId) { sendJson({ ok: false, error: '私聊不需要 @' }, 400); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          let quotedInfo = null;
+          let actualReplyToMessageId = body.replyToMessageId;
+          if (body.replyToMessageId !== undefined && body.replyToMessageId !== null && String(body.replyToMessageId).trim() !== '') {
+            const resolved = await resolveReplyTargetV2(getSocialV2State(key), keyMatch[1], Number(keyMatch[2]), String(body.replyToMessageId).trim());
+            if (!resolved) {
+              sendJson({ ok: false, error: '无法解析被引用消息，请确认 message id 正确且属于当前会话' }, 400);
+              return;
+            }
+            quotedInfo = resolved.info;
+            actualReplyToMessageId = resolved.messageId;
+          }
+          if (body.dryRun === true) {
+            try {
+              const imageInfo = ownerKey
+                ? readOwnerImageFile(image)
+                : readImageFile(imageLibraryDir(), image, { maxBytes: MAX_MEDIA_BYTES });
+              sendJson({
+                ok: true,
+                dryRun: true,
+                key,
+                image: imageInfo.relativePath,
+                path: imageInfo.path,
+                mimeType: imageInfo.mimeType,
+                bytes: imageInfo.bytes,
+                sha256: imageInfo.sha256,
+              });
+            } catch (error) {
+              sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+            }
+            return;
+          }
+          const sendCfg = cfg.socialV2?.send ?? {};
+          const now = Date.now();
+          try {
+            const st = getSocialV2State(key);
+            const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
+            const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
+            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
+            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
+            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+              sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
+              return;
+            }
+            st.sendTimes.push(now);
+            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            const sent = await sendImageV2(key, image, {
+              replyToMessageId: actualReplyToMessageId,
+              atUserId: body.atUserId ?? null,
+              review: body.review,
+              allowOutside: ownerKey,
+            });
+            const text = `[图片:${sent.name}]`;
+            st.recentMessages.push({
+              messageId: sent.messageId ? String(sent.messageId) : null,
+              sender: '我',
+              text,
+              plain: text,
+              quoteTargetIsSelf: false,
+              isOwner: true,
+              ownerLabel: '我',
+              isSelf: true,
+              media: [],
+              hasMedia: true,
+              image: {
+                path: sent.image,
+                mimeType: sent.mimeType,
+                bytes: sent.bytes,
+                sha256: sent.sha256,
+                verified: sent.verified
+              },
+              selfReview: sent.review,
+              forwardIds: [],
+              hasForward: false,
+              time: Date.now()
+            });
+            const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
+            if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+            st.lastAiReplyAt = now;
+            st.lastActionAt = now;
+            st.wakeConfig.noActionCount = 0;
+            st.preSleepWaitSatisfiedAt = 0;
+            st.preSleepWaitObservedAt = 0;
+            st.preSleepWaitAccumMs = 0;
+            saveSocialV2State();
+            scheduleReplyCheckV2(key);
+            log(`[image] 发送图片 ${key}: ${sent.image} messageId=${sent.messageId ?? '?'} verified=${sent.verified}`);
+            appendActivity(`${key} [image] 发送图片：${sent.image}${sent.verified ? '（已回读）' : '（未回读）'}`);
+            sendJson({
+              ok: true,
+              key,
+              sent: 1,
+              failed: 0,
+              image: sent.image,
+              messageId: sent.messageId,
+              verified: sent.verified,
+              verificationError: sent.verificationError,
+              review: sent.review,
+              quoted: quotedInfo
+            });
+          } catch (error) {
+            const st = getSocialV2State(key);
+            const idx = st.sendTimes.indexOf(now);
+            if (idx >= 0) st.sendTimes.splice(idx, 1);
+            saveSocialV2State();
+            log(`[image] 发送图片失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `发送图片失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/schedule-intention') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: '主动意图必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (!v2ToolEnabled('scheduleIntention')) { sendJson({ ok: false, error: '工具未启用：qq_schedule_intention' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch || !modeAllowed(key, keyMatch[1], Number(keyMatch[2]), cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          try {
+            const result = await scheduleIntentionV2(key, body);
+            sendJson({ ok: true, key, ...result });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
           }
           return;
         }
@@ -6033,8 +7151,10 @@ async function main() {
           cancelReplyCheckV2(key); // AI 正在主动等待，取消回复检查定时器避免重复唤醒
           // A reply wait must also include messages received while the model
           // was reading/thinking after its snapshot, before this HTTP request.
-          const requestSeq = st.lastUnreadSeq || 0;
-          const baseline = replyWait && (v2ToolEnabled('getUnread') || v2ToolEnabled('getRecent')) ? readThroughSeqV2(st) : requestSeq;
+          // Both wait purposes compare against what the model has actually read.
+          // Using lastUnreadSeq for ordinary waits hides messages already queued
+          // when the tool call starts, then blocks until a *later* batch arrives.
+          const baseline = readThroughSeqV2(st);
           const start = Date.now();
           let arrived = false;
           let lastNewAt = 0;
@@ -6839,6 +7959,10 @@ async function main() {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
+          if (kind === 'group' && token && !groupSendScopeAllowedV2(key)) {
+            sendJson({ ok: false, error: '群目标没有绑定当前对话或明确指令：请在 owner 私聊里写出群号，或等群会话自己收到消息后再发' }, 403);
+            return;
+          }
           if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '' && !/^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) {
             sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数（消息 id 可能为负数）' }, 400);
             return;
@@ -7030,13 +8154,30 @@ async function main() {
         }
         // ── 重启桥接（守护模式下 5 秒后自动拉起） ──────────────────────────────
         if (req.method === 'POST' && url.pathname === '/api/restart') {
-          sendJson({ ok: true, message: '正在重启桥接（若由守护窗口启动，5 秒后自动恢复）…' });
+          sendJson({ ok: true, message: '正在重启桥接（隐藏自拉起，计划任务兜底）…' });
           setTimeout(() => {
             log('控制台：重启桥接');
             // 退出前落盘：SIGINT/SIGTERM 的收尾路径会 saveState()/saveSocialV2State()，
             // 而重启这条路径以前直接 process.exit，500ms 窗口内改动的唤醒配置/计数器会丢。
             try { saveState(); } catch (error) { log('重启前保存会话映射失败:', error?.message ?? error); }
             try { saveSocialV2State(); } catch (error) { log('重启前保存二代会话状态失败:', error?.message ?? error); }
+            // 不能只靠每分钟一次的计划任务：实测一次接口重启会让 QQ 静默接近一分钟。
+            // 隐藏 WScript 先等旧进程释放锁和端口，再拉起同一份 bridge。计划任务仍作兜底。
+            try {
+              atomicWriteJson(RESTART_MARKER_FILE, { startedAt: Date.now(), oldPid: process.pid, source: 'api-restart' });
+              const relaunch = path.join(ROOT, 'scripts', 'bridge-relaunch-hidden.vbs');
+              if (process.platform === 'win32' && fs.existsSync(relaunch)) {
+                const child = spawn('C:\\Windows\\System32\\wscript.exe', ['//B', relaunch], {
+                  cwd: ROOT,
+                  detached: true,
+                  stdio: 'ignore',
+                  windowsHide: true
+                });
+                child.unref();
+              }
+            } catch (error) {
+              log(`隐藏自拉起失败，将由计划任务兜底：${error?.message ?? error}`);
+            }
             releaseLock();
             process.exit(0);
           }, 500);
@@ -7071,6 +8212,36 @@ async function main() {
 
   // QQ 发送队列（顺序发送 + 间隔，避免触发频率限制）
   let sendChain = Promise.resolve();
+  let systemFaceMap = new Map();
+  let systemFaceMapPromise = null;
+
+  // 系统表情目录来自网关本身，不维护第二份容易腐烂的 id 表。失败时退化成
+  // 普通文本，绝不影响正常回复。
+  async function ensureSystemFaceMap() {
+    if (cfg.socialV2?.faces?.enabled === false || systemFaceMap.size) return systemFaceMap;
+    if (systemFaceMapPromise) return systemFaceMapPromise;
+    systemFaceMapPromise = (async () => {
+      try {
+        const response = await bot.request('fetch_sys_faces', { refresh: false });
+        if (response?.status === 'ok' && response?.retcode === 0) {
+          systemFaceMap = buildFaceMap(response.data);
+          log(`[face] 已载入 QQ 系统表情 ${systemFaceMap.size} 个名称`);
+        }
+      } catch (error) {
+        log(`[face] 系统表情目录加载失败，按普通文本发送：${error?.message ?? error}`);
+      } finally {
+        systemFaceMapPromise = null;
+      }
+      return systemFaceMap;
+    })();
+    return systemFaceMapPromise;
+  }
+
+  async function qqMessageForText(value) {
+    const map = await ensureSystemFaceMap();
+    return textToQqSegments(value, map, escapeCqText);
+  }
+
   function redactKnownTokensOnly(text) {
     let s = String(text ?? '');
     for (const token of KNOWN_AGENT_TOKENS) {
@@ -7094,8 +8265,9 @@ async function main() {
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
-          if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
-          else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+          const message = await qqMessageForText(part);
+          if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), message), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+          else await withTimeout(bot.sendGroupMessage(Number(id), message), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
         })
         .catch((error) => {
           lastSendFailed.set(key, true);
@@ -7286,8 +8458,9 @@ async function main() {
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
-          if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
-          else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+          const message = await qqMessageForText(msg);
+          if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), message), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+          else await withTimeout(bot.sendGroupMessage(Number(id), message), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           sent.push(msg);
         })
         .catch((error) => {
@@ -7326,7 +8499,7 @@ async function main() {
       log(`发送内容包含会话令牌，已阻止发送 (${kind}:${id})`);
       throw new Error('发送内容包含会话令牌，已阻止发送');
     }
-    segments.push({ type: 'text', data: { text: escapeCqText(rawMessage) } });
+    segments.push(...await qqMessageForText(rawMessage));
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
@@ -7344,6 +8517,7 @@ async function main() {
       const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址）' : '';
       throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
     }
+    void completeActiveInitiativeV2(`${kind}:${id}`, body.data?.message_id ?? null);
     return body.data;
   }
 
@@ -7451,6 +8625,96 @@ async function main() {
     return Number.isFinite(n) && n > 0 ? Math.min(64_000_000, Math.max(1_000_000, Math.round(n))) : 64_000_000;
   })(); // 单张图片像素上限，防止“图片炸弹”解码拖垮 DSH
   const MAX_MEDIA_STORE_PER_KEY = 500; // 每个会话最多缓存多少条消息的媒体元数据，防止无限增长
+  const INBOUND_WORK_DIR = path.resolve(ROOT, String(cfg.socialV2?.media?.inbound?.workDir || 'state/inbound-media'));
+  const INBOUND_MEDIA_TTL_MS = 24 * 60 * 60 * 1000;
+  let inboundMediaChain = Promise.resolve();
+
+  function inboundMediaEnabled() {
+    return cfg.socialV2?.media?.inbound?.enabled !== false;
+  }
+
+  function inboundPythonPath() {
+    return String(cfg.socialV2?.media?.pythonPath || process.env.UTA_PYTHON || (
+      process.platform === 'win32' ? 'C:\\Python314\\python.exe' : 'python3'
+    ));
+  }
+
+  function inboundFfmpegPath() {
+    const inboundCfg = cfg.socialV2?.media?.inbound ?? {};
+    const explicit = String(inboundCfg.ffmpegPath || cfg.socialV2?.voice?.ffmpegPath || '').trim();
+    const resolved = resolveFfmpeg({ ffmpegPath: explicit || null });
+    if (resolved !== 'ffmpeg' || fs.existsSync(resolved)) return resolved;
+    const bundled = 'C:\\Users\\Clark\\AppData\\Roaming\\Python\\Python314\\site-packages\\imageio_ffmpeg\\binaries\\ffmpeg-win-x86_64-v7.1.exe';
+    return fs.existsSync(bundled) ? bundled : resolved;
+  }
+
+  function enqueueInboundMedia(task) {
+    // 单飞串行：本机只有一块 GPU，语音模型与抽帧同时跑会把内存/显存打满。
+    // 这层队列只包住富化，不包住 DSH 会话；别的会话仍可继续收发文本。
+    const run = inboundMediaChain.then(task, task);
+    inboundMediaChain = run.catch(() => {});
+    return run;
+  }
+
+  async function enrichInboundContent({ segments, messageId, textContent }) {
+    if (!inboundMediaEnabled()) return { textContent, annotations: [], media: [] };
+    const inboundCfg = cfg.socialV2?.media?.inbound ?? {};
+    return enqueueInboundMedia(async () => {
+      const enriched = await enrichInboundMessage({
+        segments,
+        messageId,
+        bot,
+        safeFetchBytes,
+        pythonPath: inboundPythonPath(),
+        ffmpegPath: inboundFfmpegPath(),
+        modelPath: String(inboundCfg.modelPath || ''),
+        maxBytes: inboundCfg.maxBytes,
+        maxSeconds: inboundCfg.maxSeconds,
+        maxFrames: inboundCfg.maxFrames,
+        workDir: INBOUND_WORK_DIR,
+        log: (message) => log(message)
+      });
+      return {
+        ...enriched,
+        textContent: applyInboundAnnotations(textContent, enriched.annotations)
+      };
+    });
+  }
+
+  function updateInboundV2Message(msg, inbound, plainContent = '') {
+    if (!msg || !inbound) return;
+    if (inbound.textContent) {
+      msg.text = truncateText(inbound.textContent, 1200);
+    }
+    if (plainContent) {
+      msg.plain = truncateText(plainContent, 1200);
+      msg.tail = truncateTextTail(plainContent, 1200);
+    }
+    if (Array.isArray(inbound.media) && inbound.media.length) {
+      const merged = [...(Array.isArray(msg.media) ? msg.media : []), ...inbound.media];
+      msg.media = merged;
+      msg.hasMedia = merged.length > 0;
+    }
+  }
+
+  function pruneInboundMediaFiles() {
+    try {
+      if (!fs.existsSync(INBOUND_WORK_DIR)) return;
+      const cutoff = Date.now() - INBOUND_MEDIA_TTL_MS;
+      for (const entry of fs.readdirSync(INBOUND_WORK_DIR, { withFileTypes: true })) {
+        const target = path.join(INBOUND_WORK_DIR, entry.name);
+        const stat = fs.statSync(target);
+        if (stat.mtimeMs < cutoff) fs.rmSync(target, { recursive: entry.isDirectory(), force: true });
+      }
+    } catch (error) {
+      log(`清理入站媒体临时文件失败：${error?.message ?? error}`);
+    }
+  }
+  pruneInboundMediaFiles();
+  {
+    const timer = setInterval(pruneInboundMediaFiles, 6 * 60 * 60 * 1000);
+    timer.unref?.();
+  }
 
   function isSafeLocalMediaPath(filePath) {
     try {
@@ -7459,6 +8723,16 @@ async function main() {
       if (!homeDir) return false;
       const realHome = fs.realpathSync(homeDir);
       return real === realHome || real.startsWith(realHome + path.sep);
+    } catch {
+      return false;
+    }
+  }
+
+  function isSafeInboundMediaPath(filePath) {
+    try {
+      const realRoot = fs.realpathSync(INBOUND_WORK_DIR);
+      const real = fs.realpathSync(String(filePath));
+      return real === realRoot || real.startsWith(realRoot + path.sep);
     } catch {
       return false;
     }
@@ -7618,14 +8892,38 @@ async function main() {
     const parts = [];
     let index = 0;
     let totalBytes = 0;
+    let animatedFramesRemaining = 4;
     for (const media of Array.isArray(mediaList) ? mediaList : []) {
+      if (!media || typeof media !== 'object') continue;
+      // 语音/视频本身已由富化层变成文字证据；这里只处理抽出来的图片帧。
+      if (media.kind === 'record' || media.kind === 'video') continue;
       index += 1;
       if (index > MAX_MEDIA_COUNT) {
         parts.push({ type: 'text', text: `[图片/表情 ${index}（超过单条上限 ${MAX_MEDIA_COUNT}，已跳过）]` });
         continue;
       }
-      if (!media || typeof media !== 'object') continue;
-      if (media.kind === 'face') {
+      if (media.kind === 'inbound-frame') {
+        try {
+          const framePath = path.resolve(String(media.path ?? ''));
+          if (!isSafeInboundMediaPath(framePath)) throw new Error('帧路径越界');
+          const stat = fs.statSync(framePath);
+          if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_MEDIA_BYTES || totalBytes + stat.size > MAX_MEDIA_BYTES) {
+            throw new Error('帧为空或超过大小限制');
+          }
+          const accepted = acceptImageBuffer(fs.readFileSync(framePath), `视频帧${index}`);
+          if (!accepted) throw new Error('帧不是有效图片');
+          totalBytes += accepted.buffer.length;
+          parts.push({ type: 'text', text: `[视频帧${index}]` });
+          parts.push({
+            type: 'image',
+            mediaType: accepted.mimeType || 'image/jpeg',
+            data: accepted.buffer.toString('base64'),
+            name: `inbound-frame-${index}.${(accepted.mimeType || 'image/jpeg').split('/')[1]}`
+          });
+        } catch (error) {
+          parts.push({ type: 'text', text: `[视频帧${index}（读取失败：${error?.message ?? error}）]` });
+        }
+      } else if (media.kind === 'face') {
         const face = await fetchFaceMedia(media);
         if (face.buffer) {
           if (totalBytes + face.buffer.length > MAX_MEDIA_BYTES) {
@@ -7651,6 +8949,53 @@ async function main() {
           totalBytes += img.buffer.length;
           parts.push({ type: 'text', text: label });
           parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}` });
+          if (!sticker && img.mimeType === 'image/gif' && animatedFramesRemaining > 0) {
+            try {
+              const digest = crypto.createHash('sha1').update(img.buffer).digest('hex');
+              const frameDir = path.join(INBOUND_WORK_DIR, `gif-${digest}`);
+              let framePaths = [];
+              if (fs.existsSync(frameDir)) {
+                framePaths = fs.readdirSync(frameDir)
+                  .filter((name) => /^frame-\d+\.jpg$/i.test(name))
+                  .sort()
+                  .map((name) => path.join(frameDir, name));
+              } else {
+                fs.mkdirSync(frameDir, { recursive: true });
+                const inputPath = path.join(frameDir, 'input.gif');
+                fs.writeFileSync(inputPath, img.buffer);
+                const extracted = await extractAnimatedImageFrames({
+                  inputPath,
+                  pythonPath: inboundPythonPath(),
+                  ffmpegPath: inboundFfmpegPath(),
+                  outDir: frameDir,
+                  maxFrames: Math.min(4, animatedFramesRemaining),
+                  maxBytes: MAX_MEDIA_BYTES,
+                  log: (message) => log(message)
+                });
+                framePaths = extracted.frames;
+                try { fs.rmSync(inputPath, { force: true }); } catch {}
+              }
+              for (const [frameIndex, framePath] of framePaths.slice(0, animatedFramesRemaining).entries()) {
+                const stat = fs.statSync(framePath);
+                if (totalBytes + stat.size > MAX_MEDIA_BYTES) break;
+                const frameBuffer = fs.readFileSync(framePath);
+                const acceptedFrame = acceptImageBuffer(frameBuffer, `动图帧${frameIndex + 1}`);
+                if (!acceptedFrame) continue;
+                totalBytes += acceptedFrame.buffer.length;
+                animatedFramesRemaining -= 1;
+                parts.push({ type: 'text', text: `[动图帧${index}.${frameIndex + 1}]` });
+                parts.push({
+                  type: 'image',
+                  mediaType: acceptedFrame.mimeType || 'image/jpeg',
+                  data: acceptedFrame.buffer.toString('base64'),
+                  name: `qq-gif-${index}-${frameIndex + 1}.jpg`
+                });
+                if (animatedFramesRemaining <= 0) break;
+              }
+            } catch (error) {
+              log(`动图 ${index} 抽帧失败，保留首帧：${error?.message ?? error}`);
+            }
+          }
         } else {
           parts.push({ type: 'text', text: `${label}（获取失败）` });
         }
@@ -7664,13 +9009,35 @@ async function main() {
     let index = 0;
     let totalBytes = 0;
     for (const media of Array.isArray(mediaList) ? mediaList : []) {
+      if (!media || typeof media !== 'object') continue;
+      if (media.kind === 'record' || media.kind === 'video') continue;
       index += 1;
       if (index > MAX_MEDIA_COUNT) {
         out.push({ index, kind: media?.kind === 'face' ? 'face' : (media?.kind === 'sticker' ? 'sticker' : 'image'), text: `（超过单条上限 ${MAX_MEDIA_COUNT}，已跳过）` });
         continue;
       }
-      if (!media || typeof media !== 'object') continue;
-      if (media.kind === 'face') {
+      if (media.kind === 'inbound-frame') {
+        try {
+          const framePath = path.resolve(String(media.path ?? ''));
+          if (!isSafeInboundMediaPath(framePath)) throw new Error('帧路径越界');
+          const stat = fs.statSync(framePath);
+          if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_MEDIA_BYTES || totalBytes + stat.size > MAX_MEDIA_BYTES) {
+            throw new Error('帧为空或超过大小限制');
+          }
+          const accepted = acceptImageBuffer(fs.readFileSync(framePath), `视频帧${index}`);
+          if (!accepted) throw new Error('帧不是有效图片');
+          totalBytes += accepted.buffer.length;
+          out.push({
+            index,
+            kind: 'inbound-frame',
+            mimeType: accepted.mimeType || 'image/jpeg',
+            data: accepted.buffer.toString('base64'),
+            text: `[视频帧${index}]`
+          });
+        } catch (error) {
+          out.push({ index, kind: 'inbound-frame', text: `（视频帧读取失败：${error?.message ?? error}）` });
+        }
+      } else if (media.kind === 'face') {
         const face = await fetchFaceMedia(media);
         if (face.buffer) {
           if (totalBytes + face.buffer.length > MAX_MEDIA_BYTES) {
@@ -7724,10 +9091,14 @@ async function main() {
 
   function mediaHintFor(key, messageRef, mediaList) {
     if (!Array.isArray(mediaList) || mediaList.length === 0 || !messageRef) return '';
+    const visual = mediaList.filter((m) => ['image', 'sticker', 'face', 'inbound-frame'].includes(m?.kind));
+    const frames = visual.filter((m) => m?.kind === 'inbound-frame').length;
+    if (visual.length === 0) return '';
+    const frameNote = frames ? `（其中 ${frames} 张是视频抽帧，已直接内联）` : '';
     if (currentMode === 'reserved2') {
-      return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
+      return `\n【图片/表情】本条消息包含 ${visual.length} 个图片/表情${frameNote}（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
     }
-    return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。`;
+    return `\n【图片/表情】本条消息包含 ${visual.length} 个图片/表情${frameNote}（消息ID=${messageRef}）。`;
   }
 
   function findMessageMedia(key, ref) {
@@ -7941,7 +9312,9 @@ async function main() {
       // closed-agent 仅 owner 私聊、本来就用完整工具面，回退不构成提权。
       const strictPreset = currentMode !== 'closed-agent';
       if (strictPreset && !preset) {
-        const wanted = currentMode === 'reserved2' ? (cfg.socialV2?.agentPreset || cfg.agentPreset) : cfg.agentPreset;
+        const wanted = preset || (currentMode === 'reserved2'
+          ? (cfg.socialV2?.agentPreset || cfg.agentPreset)
+          : cfg.agentPreset);
         throw new Error(`拒绝为 ${key} 创建会话：模式 ${currentMode} 需要 preset "${wanted}"，但它不在 DSH 可用清单中（${dshPresetIds.join(', ') || '未知'}）。回退到 DSH 默认 preset 会把本地工具暴露给 QQ 群；请先运行 node scripts/setup-dsh.mjs 并重启 DSH。`);
       }
       // 归组：所有 QQ 会话挂到同一个 workspace（幂等创建），GUI 里不再散落「未分组」
@@ -8236,6 +9609,7 @@ async function main() {
         sleepTimer: null,
         replyCheckTimer: null,
         proactiveTimer: null,
+        initiativeClaim: null,
         rateLimitRetryTimer: null,
         lastIncomingAt: 0,
         preSleepWaitSatisfiedAt: 0,
@@ -8246,7 +9620,8 @@ async function main() {
         modelSeenSeqs: new Set(),
         activeTopics: [],
         pendingThoughts: [],
-        memberImpressions: {}
+        memberImpressions: {},
+        capabilities: {}
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
@@ -8305,6 +9680,7 @@ async function main() {
             sleepTimer: null,
             replyCheckTimer: null,
             proactiveTimer: null,
+            initiativeClaim: null,
             lastIncomingAt: Number(val.lastIncomingAt) || 0,
             preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
@@ -8315,6 +9691,8 @@ async function main() {
             modelSeenSeqs: new Set(),
             activeTopics: Array.isArray(val.activeTopics) ? val.activeTopics : [],
             pendingThoughts: Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [],
+            capabilities: val.capabilities && typeof val.capabilities === 'object' && !Array.isArray(val.capabilities)
+              ? val.capabilities : {},
             memberImpressions: (() => {
               const rawImp = (val.memberImpressions && typeof val.memberImpressions === 'object') ? val.memberImpressions : {};
               const clean = {};
@@ -8402,6 +9780,7 @@ async function main() {
           lastReadThroughSeq: st.lastReadThroughSeq || 0,
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
+          capabilities: st.capabilities && typeof st.capabilities === 'object' ? st.capabilities : {},
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
           seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
         };
@@ -8635,6 +10014,45 @@ async function main() {
       }
     }
     return lines.join('\n');
+  }
+
+  /**
+   * 运行时能力状态：只记录本会话真实成功过的动作，不记录模型自述。
+   * 旧对话里说“不能用”可以是历史；这一块反映最近一次工具结果，用来消歧。
+   */
+  function markCapabilityV2(key, name, details = {}) {
+    const canonical = canonicalV2Key(key);
+    if (!canonical || !name) return null;
+    const st = getSocialV2State(canonical);
+    if (!st.capabilities || typeof st.capabilities !== 'object' || Array.isArray(st.capabilities)) st.capabilities = {};
+    const previous = st.capabilities[name] && typeof st.capabilities[name] === 'object' ? st.capabilities[name] : {};
+    st.capabilities[name] = {
+      ...previous,
+      ...details,
+      verified: details.verified !== false,
+      lastVerifiedAt: Date.now()
+    };
+    saveSocialV2State();
+    return st.capabilities[name];
+  }
+
+  function buildCapabilityStateV2(st) {
+    const lines = [];
+    const voiceEnabled = cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false;
+    const voice = st?.capabilities?.voice;
+    if (!voiceEnabled) {
+      lines.push('- 语音：当前关闭');
+    } else if (voice?.verified && Number(voice.lastVerifiedAt) > 0) {
+      const when = new Date(Number(voice.lastVerifiedAt)).toLocaleString('zh-CN', { hour12: false });
+      const messageId = voice.messageId !== undefined && voice.messageId !== null ? `，messageId=${voice.messageId}` : '';
+      const duration = Number(voice.durationSec) > 0 ? `，时长 ${Number(voice.durationSec).toFixed(2)} 秒` : '';
+      lines.push(`- 语音：可用（${when} 真实发送成功${duration}${messageId}）`);
+    } else {
+      lines.push('- 语音：工具已配置，本会话尚无真实发送成功证据；不要凭旧对话断言不可用');
+    }
+    return lines.length
+      ? `【当前能力状态】\n${lines.join('\n')}\n若旧对话与这里冲突，以这里的当前能力和实际工具结果为准。`
+      : '';
   }
 
   function appendMemoryV2(st, category, content, extra = {}) {
@@ -8945,6 +10363,9 @@ async function main() {
       }
       throw error;
     }
+    // 预算只观测，压缩仍由 DSH 的 compaction-basic 负责；这里保证控制台和日志看到
+    // 的是最新投影，而不是“感觉上下文还够”。
+    void refreshSessionContext(sessionId).catch(() => {});
     let wakeState;
     let wakeToken;
     let wakeSnapshot;
@@ -8960,9 +10381,39 @@ async function main() {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
       }
     }
+    if (opts.wakeReason !== 'bootstrap'
+        && cfg.memoryRetrieval?.enabled !== false
+        && !String(promptText).trimStart().startsWith('/')) {
+      const evidenceQuery = [
+        ...((Array.isArray(wakeSnapshot?.messages) ? wakeSnapshot.messages : []).map((m) => m?.plain || m?.text || '')),
+        promptText
+      ].join(' ').slice(-1800);
+      try {
+        const memory = await fetchMemoryEvidence({
+          query: evidenceQuery,
+          baseUrl: cfg.memoryRetrieval.baseUrl,
+          budget: cfg.memoryRetrieval.budget,
+          maxChars: cfg.memoryRetrieval.maxChars,
+          timeoutMs: cfg.memoryRetrieval.timeoutMs,
+          sessionId: key,
+          fetchImpl: fetch
+        });
+        if (memory.block) {
+          promptText = `${memory.block}\n\n${promptText}`;
+          log(`[memory] ${key} 主动检索到 ${memory.items.length} 条经历（${memory.sufficient ? '充分' : '不充分'}）`);
+        }
+      } catch (error) {
+        log(`[memory] ${key} 主动检索失败，本次按无记忆继续：${error?.message ?? error}`);
+      }
+    }
+    const inlineMedia = [
+      ...(Array.isArray(opts.media) ? opts.media : []),
+      ...((Array.isArray(wakeSnapshot?.messages) ? wakeSnapshot.messages : [])
+        .flatMap((message) => Array.isArray(message?.media) ? message.media : []))
+    ];
     let content = [{ type: 'text', text: withSlangContext(promptText) }];
-    if (Array.isArray(opts.media) && opts.media.length > 0) {
-      const imageParts = await resolveMediaList(opts.media);
+    if (inlineMedia.length > 0) {
+      const imageParts = await resolveMediaList(inlineMedia);
       content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
     }
     // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
@@ -9045,7 +10496,7 @@ async function main() {
         if (timers.size === 0) social.pendingTimers.delete(key);
       }
       deliverPrompt(key, promptText, { farewell, media: media ?? [] }).catch((error) => log(`社交投递异常 ${key}: ${error?.message ?? error}`));
-    }, delay);
+    }, scanMs);
     const timers = social.pendingTimers.get(key) ?? new Set();
     timers.add(timer);
     social.pendingTimers.set(key, timers);
@@ -9610,16 +11061,24 @@ async function main() {
     // 与「部分表情 20 秒超时」的根因）；丢了 summary，模型只看到「[图片1]」而不是「[表情:给你糖吃]」；
     // kind 被拍平还会让 mface（市场表情）被当成普通图片。
     const safeMedia = Array.isArray(media) ? media.map((m) => {
-      const kind = m?.kind === 'face' ? 'face' : (m?.kind === 'sticker' ? 'sticker' : 'image');
+      const kind = ['face', 'sticker', 'record', 'video', 'inbound-frame'].includes(m?.kind) ? m.kind : 'image';
       const item = { kind };
       if (m?.file) item.file = String(m.file);
       if (m?.url) item.url = String(m.url);
+      if (m?.path) item.path = String(m.path);
+      if (m?.mimeType) item.mimeType = String(m.mimeType);
+      if (Number.isFinite(Number(m?.durationSec))) item.durationSec = Number(m.durationSec);
       if (m?.faceId) item.faceId = String(m.faceId);
       if (m?.emojiId) item.emojiId = String(m.emojiId);
       if (m?.summary) item.summary = sanitizeMediaSummary(m.summary);
       if (m?.subType) item.subType = String(m.subType);
       return item;
-    }).filter((m) => (m.kind === 'face' ? !!m.faceId : !!(m.file || m.url || m.emojiId))) : [];
+    }).filter((m) => {
+      if (m.kind === 'face') return !!m.faceId;
+      if (m.kind === 'record' || m.kind === 'video') return !!(m.file || m.url);
+      if (m.kind === 'inbound-frame') return !!m.path;
+      return !!(m.file || m.url || m.emojiId);
+    }) : [];
     const safeForwardIds = (Array.isArray(forwardIds) ? forwardIds : []).map(sanitizeForwardId).filter(Boolean);
     if (safeForwardIds.length) {
       let set = seenForwardIds.get(key);
@@ -9671,6 +11130,7 @@ async function main() {
       if (topicHit || participantHit) t.lastMentionAt = Date.now();
     }
     saveSocialV2State();
+    return msg;
   }
 
   // 二代拍一拍事件写入最近/未读消息流，让 AI 能看到“谁拍了拍谁/拍了拍我”。
@@ -10006,6 +11466,11 @@ async function main() {
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    const ownerControlLine = isOwnerPrivateKey(key, cfg.ownerQQ)
+      ? `【owner 完整 QQ 权限】这是你和落柯的私聊。你可以直接使用本地命令、文件、目标和子代理；也可以调用 qq_owner_list_actions 查询、qq_owner_action 执行改昵称、签名、头像、QQ 空间说说/评论/点赞等完整 QQ 动作。发图用 qq_generate_image，发声用 qq_synthesize_voice；发给落柯的本地图片和音频可以直接使用绝对路径。群聊仍不继承这些本地与 owner 权限。\n\n`
+      : '';
+    const capabilityText = buildCapabilityStateV2(st);
+    const capabilityLine = capabilityText ? `${capabilityText}\n\n` : '';
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
@@ -10048,7 +11513,7 @@ async function main() {
     // 后续唤醒不再带它 —— 那时它已经在这条 DSH 会话的上下文里了。
     const initialPromptText = reason === 'bootstrap' ? formatInitialPromptV2(key) : '';
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
+    const base = roleLine + identityLine + tokenLine + ownerControlLine + capabilityLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -10057,6 +11522,12 @@ async function main() {
     }
     if (reason === 'replyCheck') {
       return `${base}【回复检查】${key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n已有回复时先看消息，需要短静默就用 qq_wait_for_messages(purpose="reply") 判断对方是否说完；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。`;
+    }
+    if (String(reason).startsWith('initiative:')) {
+      const claim = st.initiativeClaim || {};
+      const reasonText = claim.reason || '有一个具体的未闭环事项';
+      const hintText = claim.contentHint ? `\n手上可用的具体内容：${claim.contentHint}` : '';
+      return `${base}【主动机会：有具体理由】${key}\n原因：${reasonText}${hintText}\n落柯已经允许全天主动；不要仅因为现在是深夜就默认拒绝。先看消息与记忆，判断内容本身是否具体、是否值得；有真正想说的结果、问题或进展，就用 qq_send_message 发出。没有新内容、对方在忙、或这条主动会显得打扰，就安静收尾（qq_mark_read 或 qq_set_wake_config），不要为了完成机会硬发。`;
     }
     if (reason === 'proactiveCheck') {
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
@@ -10109,7 +11580,16 @@ async function main() {
     const maxPerHour = Number(cfg.socialV2?.wake?.maxWakePerHour) || 0;
     const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
     const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
-    if ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour)) {
+    // Owner私聊是明确的人类输入，不是自主打扰。它可以被繁忙队列暂存，
+    // 但不能被为“自觉发言”设计的频率配额挡在门外。
+    const ownerDirectWake = isOwnerPrivateKey(key, cfg.ownerQQ) && !isTimerWakeReason(reason);
+    if (ownerDirectWake && st.rateLimitRetryTimer) {
+      clearTimeout(st.rateLimitRetryTimer);
+      st.rateLimitRetryTimer = null;
+    }
+    if (!ownerDirectWake &&
+        ((maxPerMinute > 0 && recentMinute >= maxPerMinute) ||
+         (maxPerHour > 0 && recentHour >= maxPerHour))) {
       let retryAfterMs = 0;
       if (maxPerMinute > 0 && recentMinute >= maxPerMinute) {
         const times = (st.wakeTimes || []).filter((t) => now - t < 60000).sort((a, b) => a - b);
@@ -10209,9 +11689,77 @@ async function main() {
     st.replyCheckTimer = null;
   }
 
+  function ownerPrivateNeedsAttentionV2() {
+    const ownerKey = canonicalV2Key(`private:${cfg.ownerQQ ?? ''}`);
+    if (!ownerKey) return false;
+    const ownerState = socialV2.conversations.get(ownerKey);
+    return Array.isArray(ownerState?.unread) && ownerState.unread.length > 0;
+  }
+
+  function pauseGroupAutonomyV2(source = '') {
+    let paused = 0;
+    for (const [key, st] of socialV2.conversations) {
+      if (!String(key).startsWith('group:')) continue;
+      let changed = false;
+      if (st?.proactiveTimer) {
+        clearTimeout(st.proactiveTimer);
+        st.proactiveTimer = null;
+        changed = true;
+      }
+      if (st?.replyCheckTimer) {
+        clearTimeout(st.replyCheckTimer);
+        st.replyCheckTimer = null;
+        changed = true;
+      }
+      if (changed) paused += 1;
+    }
+    if (paused > 0) {
+      log(`[priority] 暂停 ${paused} 个群的自主任务${source ? `（${source}）` : ''}：先处理老大`);
+    }
+    return paused;
+  }
+
+  /**
+   * 群发送必须能说出此刻为什么是这个群。
+   * 群会话自己刚收到消息、有未读、或持有一个群机会时，作用域天然成立；
+   * owner 从私聊跨群发送时，则必须在最近一句原话里明确写出群号。
+   * 这样“去群里看看”不会再被模型自行解释成某一个群。
+   */
+  function groupSendScopeAllowedV2(key) {
+    const group = String(key).startsWith('group:') ? getSocialV2State(key) : null;
+    if (!group) return true;
+    const now = Date.now();
+    if ((Array.isArray(group.unread) && group.unread.length > 0)
+        || (Number(group.lastIncomingAt) > 0 && now - Number(group.lastIncomingAt) < 5 * 60 * 1000)
+        || group.initiativeClaim?.id) {
+      return true;
+    }
+    const ownerKey = canonicalV2Key(`private:${cfg.ownerQQ ?? ''}`);
+    const owner = ownerKey ? socialV2.conversations.get(ownerKey) : null;
+    const groupId = String(key).slice('group:'.length);
+    return (Array.isArray(owner?.recentMessages) ? owner.recentMessages : [])
+      .filter((m) => m?.isOwner === true && now - Number(m.time || 0) < 10 * 60 * 1000)
+      .slice(-4)
+      .some((m) => {
+        const text = String(m.text || m.plain || m.tail || '');
+        return text.includes(groupId) || text.includes(`group:${groupId}`);
+      });
+  }
+
+  /**
+   * Owner私聊有未读时，群聊不得领取自主机会或补发回复检查。
+   * 这不是给群永久静音：owner未读清空后，下一轮扫描照常继续。
+   */
+  function yieldGroupToOwnerV2(key, source = '') {
+    if (!String(key).startsWith('group:') || !ownerPrivateNeedsAttentionV2()) return false;
+    pauseGroupAutonomyV2(source);
+    return true;
+  }
+
   function scheduleReplyCheckV2(key) {
     if (cfg.socialV2?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
+    if (yieldGroupToOwnerV2(key, 'replyCheck')) return;
     const st = getSocialV2State(key);
     // 已有真实唤醒/有限睡眠/回复检查在排队时不再重复安排，避免 AI 被连环唤醒。
     if (st.pendingWakeTimer || st.sleepTimer || st.replyCheckTimer) return;
@@ -10223,6 +11771,7 @@ async function main() {
     if (recentSelf.length >= 3) delay = Math.round(delay * 1.3);
     st.replyCheckTimer = setTimeout(() => {
       st.replyCheckTimer = null;
+      if (yieldGroupToOwnerV2(key, 'replyCheck-fired')) return;
       void sendWakePromptV2(key, 'replyCheck').catch((error) => log(`[reserved2] replyCheck 唤醒异常 ${key}:`, error?.message ?? error));
     }, delay);
     st.replyCheckTimer.unref?.();
@@ -10277,6 +11826,7 @@ async function main() {
     anyMessage: 50,
     replyCheck: 40,
     timeout: 30,
+    initiative: 25,
     proactiveCheck: 20
   };
 
@@ -10289,7 +11839,7 @@ async function main() {
   // 与「未读消息」无关的唤醒原因（定时器/引导）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin']);
+  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'initiative', 'proactiveCheck', 'bootstrap', 'admin']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
@@ -10428,38 +11978,104 @@ async function main() {
     st.proactiveTimer = null;
   }
 
-  function scheduleProactiveCheckV2(key) {
+  function scheduleProactiveCheckV2(key, requestedDelayMs = null) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
+    if (yieldGroupToOwnerV2(key, 'initiative')) return;
     const st = getSocialV2State(key);
     if (st.proactiveTimer) return;
     const p = cfg.socialV2?.proactive ?? {};
-    const min = Math.max(60 * 1000, Number(p.checkIntervalMinMs) || 30 * 60 * 1000);
-    const max = Math.max(min, Number(p.checkIntervalMaxMs) || 90 * 60 * 1000);
-    const delay = Math.floor(min + Math.random() * (max - min));
+    // 这个定时器只扫描“已经到期的具体意图/承诺”，不生成随机话题。
+    const scanMs = Math.max(60 * 1000, Math.min(5 * 60 * 1000, Number(p.scanIntervalMs) || 60 * 1000));
+    const waitMs = Number.isFinite(Number(requestedDelayMs))
+      ? Math.max(scanMs, Number(requestedDelayMs))
+      : scanMs;
     st.proactiveTimer = setTimeout(() => {
       st.proactiveTimer = null;
       ensureWakeableV2(st, { key });
-      const idleThreshold = Number(p.idleThresholdMs) || 15 * 60 * 1000;
-      const idle = Date.now() - (st.lastIncomingAt || 0);
-      const probBase = Number(p.probability);
-      let prob = Math.min(1, Math.max(0, Number.isFinite(probBase) ? probBase : 0.4));
-      const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt))).length : 0;
-      if (pendingThoughts > 0) prob = Math.min(1, prob * 1.4);
-      if (st.lastAiReplyAt && Date.now() - Number(st.lastAiReplyAt) < 30 * 60 * 1000) prob *= 0.5;
-      const hour = new Date().getHours();
-      if (hour >= 23 || hour < 8) prob *= 0.3;
-      const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
-      const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
-      if (aiCount >= 5) prob *= 0.3;
-      if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
-        void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
-      }
-      scheduleProactiveCheckV2(key);
-    }, delay);
+      let nextDelayMs = scanMs;
+      void (async () => {
+        try {
+          if (yieldGroupToOwnerV2(key, 'initiative-fired')) return;
+          if (st.initiativeClaim?.id) {
+            const claimAge = Date.now() - Number(st.initiativeClaim.claimedAt || 0);
+            if (claimAge > 15 * 60 * 1000) {
+              log(`[initiative] ${key} 待唤醒意图 ${st.initiativeClaim.id} 已过期，丢弃`);
+              st.initiativeClaim = null;
+            } else if (st.initiativeClaim.wakeSentAt && Date.now() - Number(st.initiativeClaim.wakeSentAt) < 10 * 60 * 1000) {
+              log(`[initiative] ${key} 意图 ${st.initiativeClaim.id} 已唤醒，等待她处理`);
+              return;
+            }
+          }
+          if (st.initiativeClaim?.id) {
+            if (isConversationBusyV2(key, st)) {
+              log(`[initiative] ${key} 已有待唤醒意图 ${st.initiativeClaim.id}，对话仍忙，继续等待`);
+              return;
+            }
+            const existingReason = `initiative:${st.initiativeClaim.id}`;
+            log(`[initiative] ${key} 补发待唤醒意图 ${st.initiativeClaim.id}`);
+            st.initiativeClaim.wakeSentAt = Date.now();
+            await sendWakePromptV2(key, existingReason);
+            return;
+          }
+          const claimed = await claimInitiativeV2(key, st, 'idle_check');
+          const opp = claimed?.opportunity;
+          if (!opp) {
+            const retryMs = Math.max(scanMs, Math.min(5 * 60 * 1000, Number(claimed?.retry_after_ms) || scanMs));
+            nextDelayMs = retryMs;
+            const nowLog = Date.now();
+            if (!st.lastInitiativeLogAt || nowLog - Number(st.lastInitiativeLogAt) > 5 * 60 * 1000) {
+              st.lastInitiativeLogAt = nowLog;
+              log(`[initiative] ${key} 无可发意图（${claimed?.reason || 'none'}），${Math.round(retryMs / 1000)}s 后再看`);
+            }
+          } else if (!isConcreteInitiativeOpportunity(opp)) {
+            try {
+              await initiativeApi('/v1/initiative/ack', {
+                id: opp.id,
+                claim_token: opp.claim_token,
+                status: 'skipped',
+                outcome: 'bridge rejected non-concrete opportunity',
+              });
+            } catch (error) {
+              log(`[initiative] 空壳机会回执失败 ${key}: ${error?.message ?? error}`);
+            }
+            nextDelayMs = initiativeRetryDelay(p);
+            log(`[initiative] ${key} 拒绝空壳机会 ${opp.id}（${opp.source}）：${String(opp.reason || '').slice(0, 120)}`);
+          } else if (isConversationBusyV2(key, st)) {
+            st.initiativeClaim = {
+              id: opp.id,
+              claim_token: opp.claim_token,
+              claimedAt: Date.now(),
+              wakeSentAt: 0,
+              reason: opp.reason,
+              contentHint: opp.content_hint,
+              source: opp.source
+            };
+            log(`[initiative] ${key} 对话正忙，意图 ${opp.id} 暂存到本轮结束后处理`);
+          } else {
+            st.initiativeClaim = {
+              id: opp.id,
+              claim_token: opp.claim_token,
+              claimedAt: Date.now(),
+              wakeSentAt: Date.now(),
+              reason: opp.reason,
+              contentHint: opp.content_hint,
+              source: opp.source
+            };
+            const reason = `initiative:${opp.id}`;
+            log(`[initiative] ${key} 领取具体机会 ${opp.id}（${opp.source}, score=${opp.score}）：${opp.reason}`);
+            await sendWakePromptV2(key, reason);
+          }
+        } catch (error) {
+          log(`[initiative] ${key} 主动机会异常: ${error?.message ?? error}`);
+        } finally {
+          scheduleProactiveCheckV2(key, nextDelayMs);
+        }
+      })();
+    }, waitMs);
     st.proactiveTimer.unref?.();
-    log(`[reserved2] 已安排主动机会检查 ${key}，约 ${Math.round(delay / 60000)}min 后`);
+    log(`[initiative] 已安排意图扫描 ${key}，${Math.round(waitMs / 1000)}s 后`);
   }
 
   function clearSocialV2Timers(key) {
@@ -10520,6 +12136,7 @@ async function main() {
       log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
       return;
     }
+    void noteInitiativeFeedbackV2(key, 'continued');
     const resolveAtName = async (qq) => {
       // 只有群聊才需要把 @QQ号 解析成群名片/昵称；私聊没有群成员概念
       if (kind !== 'group') return null;
@@ -10528,8 +12145,8 @@ async function main() {
     const resolveReply = (messageId) => resolveReplyInfo(kind, id, messageId, event.self_id);
     // textContent 带引用对象信息，供 DSH 判断“这句话在对谁说”；
     // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
-    const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
-    const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
+    let textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
+    let plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
     const mediaList = extractMediaFromSegments(event.message ?? []);
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
@@ -10554,6 +12171,9 @@ async function main() {
     if (!isSessionAllowedInCurrentMode(key)) return;
     if (!plainContent && !quoteTargetIsSelf) return;
     const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
+    if (isOwner && isOwnerPrivateKey(key, cfg.ownerQQ)) {
+      pauseGroupAutonomyV2(`owner:${key}`);
+    }
     const roleState = readRoleState();
 
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
@@ -10673,7 +12293,32 @@ async function main() {
     // 二代仿真模式（reserved2）：唤醒调度
     if (currentMode === 'reserved2') {
       const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
-      appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
+      const stored = appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
+      if (isOwner && isOwnerPrivateKey(key, cfg.ownerQQ)) {
+        void captureOwnerDirectiveV2(
+          key,
+          plainContent,
+          event.message_id ?? event.msg_id ?? null,
+        );
+      }
+      if (mediaList.some((m) => m?.kind === 'record' || m?.kind === 'video')) {
+        try {
+          const inbound = await enrichInboundContent({
+            segments: event.message ?? [],
+            messageId: event.message_id ?? event.msg_id ?? null,
+            textContent
+          });
+          if (inbound.annotations?.length) {
+            plainContent = applyInboundAnnotations(plainContent, inbound.annotations);
+          }
+          updateInboundV2Message(stored, inbound, plainContent);
+          if (inbound.textContent) textContent = inbound.textContent;
+          mediaList.push(...inbound.media);
+          saveSocialV2State();
+        } catch (error) {
+          log(`入站媒体富化失败，保留原始消息继续 (${key})：${error?.message ?? error}`);
+        }
+      }
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
       if (kind === 'group') feedSlangWindow(key, sender, plainContent);
       if (socialV2.paused) {
@@ -10693,6 +12338,25 @@ async function main() {
       }
       appendActivity(`${key} [reserved2] 消息已入未读：${textContent.slice(0, 80)}`);
       return;
+    }
+
+    // 一代/普通对话：先把语音转写、视频帧与音轨变成真实证据，再拼 prompt。
+    // 二代在上面已经先入未读再富化，避免慢媒体阻塞后续消息入库。
+    if (mediaList.some((m) => m?.kind === 'record' || m?.kind === 'video')) {
+      try {
+        const inbound = await enrichInboundContent({
+          segments: event.message ?? [],
+          messageId: event.message_id ?? event.msg_id ?? null,
+          textContent
+        });
+        if (inbound.textContent) textContent = inbound.textContent;
+        if (inbound.annotations?.length) {
+          plainContent = applyInboundAnnotations(plainContent, inbound.annotations);
+        }
+        mediaList.push(...inbound.media);
+      } catch (error) {
+        log(`入站媒体富化失败，保留占位继续 (${key})：${error?.message ?? error}`);
+      }
     }
 
     // 黑话学习素材：只从群聊普通消息进入滚动窗口（命令/角色控制语不学；只学当前消息自己的文字，不学引用原文）
@@ -11007,6 +12671,111 @@ async function main() {
     pending.set(key, entry);
   }
 
+  function outboundTextFromToolCall(toolName, args) {
+    if (!isSendToolName(toolName)) return '';
+    let value = args;
+    for (let i = 0; i < 3 && typeof value === 'string'; i++) {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        break;
+      }
+    }
+    if (!value || typeof value !== 'object') return '';
+    const raw = value.messages ?? value.message ?? value.text ?? value.content;
+    const rows = Array.isArray(raw)
+      ? raw
+      : (typeof raw === 'string' ? [raw] : []);
+    return rows
+      .map((row) => redactKnownTokensOnly(String(row ?? '')).trim())
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, 2000);
+  }
+
+  /**
+   * QQ 的工具回合不会自动把文本写进 DSH assistant/message，回复正文只在
+   * qq_send_message 参数里。因此渠道记忆必须由桥接自己落一条 episode；
+   * source_ref 与壳插件使用同一个 `sessionId:turn`，重复写入由引擎去重合并。
+   */
+  async function postQueueEpisodeV2(key, sessionId, turn, reason, assistantText) {
+    const inputRows = turnInputBySession.get(sessionId) || [];
+    const outbound = String(assistantText || '').trim();
+    turnInputBySession.delete(sessionId);
+    turnOutboundBySession.delete(sessionId);
+    if (!inputRows.length || !outbound || reason !== 'completed') return;
+
+    const userText = inputRows
+      .map((row) => {
+        const sender = row?.isOwner ? '老大' : String(row?.sender || '对方');
+        const text = String(row?.plain ?? row?.text ?? row?.tail ?? '').replace(/\s+/g, ' ').trim();
+        return text ? `${sender}：${text}` : '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, 800);
+    if (!userText) return;
+
+    const summary = `[${key.startsWith('group:') ? 'QQ群' : 'QQ'}] ${userText} → 我：${outbound.replace(/\s+/g, ' ').slice(0, 700)}`;
+    try {
+      const res = await fetch(`${initiativeApiBase()}/v1/memory/episode`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          turn: Number.isSafeInteger(Number(turn)) ? Number(turn) : null,
+          who: '老大',
+          kind: 'channel-conversation',
+          summary: summary.slice(0, 600),
+          details: {
+            channel: 'qq',
+            target: key,
+            source: 'qq-bridge',
+            reason,
+          },
+          salience: key.startsWith('group:') ? 0.55 : 0.7,
+          source_ref: `${sessionId}:${turn ?? ''}`,
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      log(`[memory] ${key} episode 写入 ok（turn ${turn ?? '?'}）`);
+    } catch (error) {
+      log(`[memory] ${key} episode 写入失败：${error?.message ?? error}`);
+    }
+  }
+
+  /**
+   * Owner principles cross shells even though chat transcripts do not.
+   *
+   * The bridge sends the real human text directly to LAAP intake, with channel
+   * and session provenance.  DSH model output is not involved, and one-off
+   * requests are filtered there before becoming durable self beliefs.
+   */
+  async function captureOwnerDirectiveV2(key, text, messageId) {
+    const value = String(text || '').trim();
+    if (!value || !isOwnerPrivateKey(key, cfg.ownerQQ)) return;
+    try {
+      const res = await fetch(`${initiativeApiBase()}/v1/owner_directive`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: value,
+          channel: 'qq_private',
+          session_id: state.sessions[key] || '',
+          source_ref: `qq:${messageId || ''}`,
+        }),
+        signal: AbortSignal.timeout(2500),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (payload?.captured?.length) {
+        appendActivity(`${key} [owner-contract] 长期纠正已进入共享记忆：${value.slice(0, 60)}`);
+      }
+    } catch (error) {
+      appendActivity(`${key} [owner-contract] 写入失败：${error?.message ?? error}`);
+    }
+  }
+
   // DSH 事件流 → QQ
 
   /**
@@ -11099,6 +12868,15 @@ async function main() {
             if (frame.event.type === 'turn/start') {
               sendToolSucceededSessions.delete(frame.sessionId);
               pendingSendToolCalls.delete(frame.sessionId);
+              const turnState = getSocialV2State(key);
+              const snapshot = buildWakeSnapshotV2(key);
+              turnInputBySession.set(
+                frame.sessionId,
+                Array.isArray(snapshot?.messages) && snapshot.messages.length
+                  ? snapshot.messages
+                  : (Array.isArray(turnState.unread) ? turnState.unread.slice(-12) : []),
+              );
+              turnOutboundBySession.set(frame.sessionId, []);
               v2TurnStartAt.set(frame.sessionId, Date.now());
               turnLeaseNoted.delete(frame.sessionId);
             }
@@ -11108,6 +12886,11 @@ async function main() {
               const args = sanitizeToolArgs(frame.event.data?.arguments ?? frame.event.data?.input ?? frame.event.data);
               appendToolLog({ type: 'call', time: new Date().toISOString(), key, sessionId: frame.sessionId, tool: toolName, args });
               if (callId != null) {
+                const outboundText = outboundTextFromToolCall(
+                  toolName,
+                  frame.event.data?.arguments ?? frame.event.data?.input,
+                );
+                if (outboundText) outboundTextByCallId.set(String(callId), outboundText);
                 if (isSendToolName(toolName)) {
                   let pending = pendingSendToolCalls.get(frame.sessionId);
                   if (!pending) {
@@ -11147,8 +12930,15 @@ async function main() {
                   if (pending.size === 0) pendingSendToolCalls.delete(frame.sessionId);
                   if (!resultError) {
                     sendToolSucceededSessions.add(frame.sessionId);
+                    const outboundText = outboundTextByCallId.get(String(callId));
+                    if (outboundText) {
+                      const sent = turnOutboundBySession.get(frame.sessionId) ?? [];
+                      sent.push(outboundText);
+                      turnOutboundBySession.set(frame.sessionId, sent.slice(-12));
+                    }
                   }
                 }
+                outboundTextByCallId.delete(String(callId));
               }
             }
             // collector 生命周期见 trackTurnEvent()：只为 turn/start 建、空壳 turn/end 即清。
@@ -11158,10 +12948,27 @@ async function main() {
               // 则累计 noActionCount；达到阈值后自动重置 WakeConfig，避免 AI 卡死。
               const silentQueueNow = social.silentTurns.get(frame.sessionId) ?? [];
               const isSilentTurn = silentQueueNow.length > 0;
+              const turnOutbound = turnOutboundBySession.get(frame.sessionId) || [];
+              const outputText = turnOutbound.length ? turnOutbound.join('\n') : ended.text;
+              if (!isSilentTurn && key) {
+                void postQueueEpisodeV2(
+                  key,
+                  frame.sessionId,
+                  ended.turn,
+                  ended.reason?.kind ?? '',
+                  outputText,
+                );
+              } else {
+                turnInputBySession.delete(frame.sessionId);
+                turnOutboundBySession.delete(frame.sessionId);
+              }
               if (currentMode === 'reserved2' && key && !isSilentTurn) {
                 const st = getSocialV2State(key);
                 const turnStart = v2TurnStartAt.get(frame.sessionId) ?? 0;
                 const sendToolHit = sendToolSucceededSessions.has(frame.sessionId);
+                if (st.initiativeClaim?.id && !sendToolHit) {
+                  void skipActiveInitiativeV2(key, 'turn ended without sending');
+                }
                 // turn/start 丢了（重连后由快照补发的回合）就无从判断「这一轮有没有行动」：
                 // 此时记 miss 会冤枉 AI，连续 3 次就把 AI 自己设的唤醒配置重置成默认值。
                 if (turnStart > 0 || sendToolHit) {

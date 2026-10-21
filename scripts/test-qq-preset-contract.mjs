@@ -14,7 +14,10 @@ const prefix = persona?.config?.prefix ?? '';
 test('reserved2 YAML resolves to the expected persona and template variables', () => {
   assert.equal(persona?.name, '@deepseek-ai/dsh-persona');
   assert.match(prefix, /\{\{model\}\}/);
-  assert.match(persona.config.suffix, /\{\{cwd\}\}/);
+  // DSH 0.2.1-rc.2 does not register {{cwd}}; keeping it makes the whole turn
+  // fail after prompt acceptance. QQ does not need a working-directory suffix.
+  assert.equal(persona.config.suffix, '');
+  assert.doesNotMatch(persona.config.suffix, /\{\{cwd\}\}/);
   assert.equal(Object.hasOwn(persona.config, 'text'), false);
 });
 

@@ -8,12 +8,27 @@ const tests = [
   'test-audit-bridge.mjs', 'test-audit-protocol.mjs', 'test-audit-protocol-helpers.mjs',
   'test-audit-security.mjs', 'test-audit-security-mcp.mjs',
   'test-audit-setup.mjs', 'test-audit-setup-guards.mjs',
+  'test-initiative.mjs',
+  'test-owner-agent-policy.mjs',
+  'test-owner-qq-control.mjs',
+  'test-media-process-error.mjs',
+  'test-inbound-media.mjs',
+  'test-qq-faces.mjs',
+  'test-link-card.mjs',
+  'test-memory-evidence.mjs',
+  'test-qq-parity.mjs',
+  'test-context-pressure.mjs',
+  'test-qq-capability-state.mjs',
+  'test-bridge-relaunch.mjs',
+  'test-send-rate-limit.mjs',
   // DSH 会话队列（inbox 投影）解析：0.2.0 把队列从 control baseline 的
   // `value.queues[<id>]` 挪进了 `value.projections[<id>].values.inbox`。
   // 认错形状的后果不是"少清几条"，而是**每一次退役会话都抛错**、旧任务继续跑，
   // 且只留下一行日志 —— 必须有登记期断言钉住（活 DSH 侧的实测见
   // scripts/test-dsh-session-retire.mjs）。
   'test-dsh-inbox-projection.mjs',
+  'test-dsh-endpoint-discovery.mjs',
+  'test-turn-collector-dedup.mjs',
   'test-md-to-plain.mjs', 'test-slang-learn.mjs', 'test-mux-reconnect.mjs',
   'test-token-economy.mjs', 'test-qq-model-view.mjs', 'test-qq-preset-contract.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-role-card.mjs',

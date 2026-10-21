@@ -80,6 +80,22 @@ const LOCAL_EXECUTION_TOOLS = [
   'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete',
 ];
 
+// These dangerous names existed in other DSH/Codex builds or are shipped only by
+// optional plugins. Keeping them in the restriction list is defense-in-depth:
+// tools.restrict ignores names that are absent in the current build, and blocks
+// them immediately if a later upgrade starts registering them. The test must not
+// force us to delete forward-compatible guards merely because today's build does
+// not expose those tools.
+const VERSION_OPTIONAL_DSH_TOOLS = new Set([
+  'load_workspace_dependencies',
+  'dsh_snapshot', 'dsh_rollback', 'incident_resolved',
+  'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
+  'subagent_codex', 'subagent_claude_code',
+  'spawn_teammate', 'team_task_create', 'team_task_get',
+  'team_task_list', 'team_task_update',
+  'plugin_manager', 'schedule_update',
+]);
+
 /**
  * 工具名 → 真实存在与否。抽取实现在 `scripts/dsh-tool-names.mjs`（唯一实现，
  * 与 `scan-dsh-tool-names.mjs` 共用），用来抓"拼错的假名"。
@@ -209,7 +225,8 @@ test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错
     const { dir } = readPreset(id);
     const mod = await import(pathToFileURL(path.join(dir, 'qq-tool-restrict.mjs')).href);
     const fabricated = mod.RESTRICTED_TOOL_NAMES
-      .filter((n) => !DEV_TOOL_PREFIX.test(n) && !dshNames.has(n));
+      .filter((n) => !DEV_TOOL_PREFIX.test(n) && !dshNames.has(n))
+      .filter((n) => !VERSION_OPTIONAL_DSH_TOOLS.has(n));
     assert.deepEqual(fabricated, [],
       `${id}: 以下名字在 DSH 已安装的工具包里找不到 ⇒ restrict 会抛错并被吞掉，`
       + `限制静默失效：${fabricated.join(', ')}`);

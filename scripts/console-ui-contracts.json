@@ -144,8 +144,11 @@
         "sendSticker": true,
         "collectSticker": true,
         "getSelfImage": true,
+        "sendImage": true,
+        "scheduleIntention": true,
         "stickerNote": true,
-        "setStickerRemark": true
+        "setStickerRemark": true,
+        "sendVoice": true
       },
       "wake": {
         "defaultMode": "diving",
@@ -198,10 +201,7 @@
       },
       "proactive": {
         "enabled": true,
-        "checkIntervalMinMs": 1800000,
-        "checkIntervalMaxMs": 5400000,
-        "idleThresholdMs": 900000,
-        "probability": 0.3
+        "scanIntervalMs": 60000
       },
       "sticker": {
         "enabled": true,
@@ -263,8 +263,11 @@
         "sendSticker": true,
         "collectSticker": true,
         "getSelfImage": true,
+        "sendImage": true,
+        "scheduleIntention": true,
         "stickerNote": true,
-        "setStickerRemark": true
+        "setStickerRemark": true,
+        "sendVoice": true
       },
       "wake": {
         "defaultMode": "diving",
@@ -317,10 +320,7 @@
       },
       "proactive": {
         "enabled": true,
-        "checkIntervalMinMs": 1800000,
-        "checkIntervalMaxMs": 5400000,
-        "idleThresholdMs": 900000,
-        "probability": 0.3
+        "scanIntervalMs": 60000
       },
       "sticker": {
         "enabled": true,

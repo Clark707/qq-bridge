@@ -24,6 +24,7 @@
   "ownerQQ": null,
   "sessionCwd": "",
   "agentPreset": "qq-chat",
+  "ownerAgentPreset": "",
   "workspaceTitle": "QQ 聊天",
   "allow": {
     "private": [],
@@ -140,7 +141,10 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": false
+      "sendImage": true,
+      "scheduleIntention": true,
+      "sendVoice": false,
+      "ownerActions": false
     },
     "wake": {
       "defaultMode": "diving",
@@ -228,14 +232,12 @@
       "defaultVolume": 1,
       "loudness": "normal",
       "ffmpegPath": "",
-      "autoReadback": true
+      "autoReadback": true,
+      "synthesizeEnabled": false
     },
     "proactive": {
       "enabled": true,
-      "checkIntervalMinMs": 1800000,
-      "checkIntervalMaxMs": 5400000,
-      "idleThresholdMs": 900000,
-      "probability": 0.3
+      "scanIntervalMs": 60000
     },
     "feedback": {
       "maxLength": 500,
@@ -254,8 +256,39 @@
     "media": {
       "maxBytes": 8388608,
       "maxPixels": 64000000,
-      "maxCount": 5
+      "maxCount": 5,
+      "imagesDir": "media/images",
+      "pythonPath": "C:\\Python314\\python.exe",
+      "maxComposeSide": 1600,
+      "maxComposeTextChars": 200,
+      "inbound": {
+        "enabled": true,
+        "maxBytes": 20971520,
+        "maxSeconds": 300,
+        "maxFrames": 16,
+        "modelPath": "Z:\\Ds工作箱\\工具\\models\\Systran\\faster-whisper-small",
+        "ffmpegPath": "",
+        "workDir": "state/inbound-media"
+      }
+    },
+    "faces": {
+      "enabled": true
     }
+  },
+  "memoryRetrieval": {
+    "enabled": true,
+    "baseUrl": "http://127.0.0.1:11546",
+    "budget": 900,
+    "maxChars": 1200,
+    "timeoutMs": 2500
+  },
+  "contextManagement": {
+    "enabled": true,
+    "refreshMs": 60000,
+    "warnRatio": 0.3,
+    "criticalRatio": 0.38,
+    "compactionRatio": 0.4,
+    "retainTokens": 64000
   },
   "webSearch": {
     "provider": "auto",

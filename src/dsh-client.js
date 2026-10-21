@@ -11,9 +11,18 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import YAML from 'js-yaml';
 import { AbstractApiClient } from '@deepseek-ai/dsh-host-apiproxy/client';
+
+const DSH_PORT_SCAN_VBS = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'scripts',
+  'dsh-port-scan.vbs',
+);
 
 /** DSH home：凭据文件与（历史）启动日志都在这里。 */
 export function resolveDshHome() {
@@ -161,6 +170,112 @@ export function isLoopbackBase(baseUrl) {
   } catch {
     return false;
   }
+}
+
+/** 把系统端口探测输出归一成去重的合法端口数组。 */
+export function parseDshListeningPorts(output) {
+  let parsed;
+  try {
+    parsed = JSON.parse(String(output ?? '').trim() || '[]');
+  } catch {
+    return [];
+  }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const ports = [];
+  for (const row of rows) {
+    const value = typeof row === 'object' && row !== null ? row.LocalPort ?? row.port : row;
+    const port = Number(value);
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || ports.includes(port)) continue;
+    ports.push(port);
+  }
+  return ports;
+}
+
+/**
+ * 找出当前 DSH 宿主实际监听的端口。
+ *
+ * DSH desktop 的 Web API 端口是每次启动动态分配的，不能把 3080 当身份。
+ * 这里只从 DSH 自己的进程树/命令行认领监听端口，再交给带鉴权的 RPC 复核；
+ * 不扫描任意本机端口，也不拿“端口有人应答”冒充 DSH 在线。
+ */
+export function discoverDshListeningPorts() {
+  if (process.platform !== 'win32') return [];
+  const outputPath = path.join(
+    os.tmpdir(),
+    `dsh-port-scan-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
+  );
+  try {
+    const wscript = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
+    execFileSync(wscript, ['//B', DSH_PORT_SCAN_VBS, outputPath], {
+      windowsHide: true,
+      timeout: 10000,
+    });
+    const output = fs.readFileSync(outputPath, 'utf8').replace(/^\uFEFF/, '');
+    return parseDshListeningPorts(output);
+  } catch {
+    return [];
+  } finally {
+    try { fs.unlinkSync(outputPath); } catch {}
+  }
+}
+
+/**
+ * 生成待复核的 DSH 基址。显式环境变量优先；其余候选都必须再经过鉴权 RPC。
+ */
+export function buildDshCandidateBaseUrls({ preferredBaseUrl = '', ports = [] } = {}) {
+  const candidates = [];
+  const add = (value) => {
+    if (!value) return;
+    try {
+      const url = new URL(String(value));
+      if (!isLoopbackBase(url.href)) return;
+      url.pathname = '';
+      url.search = '';
+      url.hash = '';
+      const normalized = url.href.replace(/\/+$/, '');
+      if (!candidates.includes(normalized)) candidates.push(normalized);
+    } catch {}
+  };
+  add(process.env.DSH_BASE_URL);
+  add(preferredBaseUrl);
+  for (const port of ports) add(`http://127.0.0.1:${port}`);
+  return candidates;
+}
+
+/**
+ * 用 DSH 自己的鉴权链复核一个候选地址。
+ *
+ * 返回 preset 数组而不是布尔值：调用方既能判断在线，也能在日志里指出
+ * “连上了，但 QQ preset 尚未安装”，避免把两个不同故障混成 dshReady=false。
+ */
+export async function probeDshBaseUrl(baseUrl, { timeoutMs = 2000 } = {}) {
+  const client = new NodeApiClient(baseUrl, timeoutMs, {});
+  const signal = AbortSignal.timeout(timeoutMs);
+  try {
+    const response = await client.callUnary('agentPresets/list', {}, signal);
+    const presets = response.result?.value?.presets;
+    if (!response.result?.ok || !Array.isArray(presets)) return null;
+    return { baseUrl: client.baseUrl, presets };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 发现当前真实 DSH API。显式 DSH_BASE_URL 是硬覆盖：它不通时直接返回 null，
+ * 不允许悄悄改连另一份 DSH，否则多实例环境会把消息发错本体。
+ */
+export async function discoverDshBaseUrl({ preferredBaseUrl = '', timeoutMs = 2000 } = {}) {
+  const candidates = buildDshCandidateBaseUrls({
+    preferredBaseUrl,
+    ports: discoverDshListeningPorts(),
+  });
+  for (const candidate of candidates) {
+    const probed = await probeDshBaseUrl(candidate, { timeoutMs });
+    if (probed) return probed;
+    if (process.env.DSH_BASE_URL) break;
+  }
+  return null;
 }
 
 /** 新协议 RPC 的 args 包装：旧 payload -> { <参数名>: payload }。 */
@@ -324,6 +439,15 @@ export class NodeApiClient extends AbstractApiClient {
   /** Node 没有 location；把 base 固定为配置的 DSH 地址（回环地址天然通过 /api 信任栅栏）。 */
   resolveBase() {
     return this.baseUrl;
+  }
+
+  /** DSH desktop 重启后端口会变化；切换地址时连同旧 Cookie/流游标一起失效。 */
+  setBaseUrl(baseUrl) {
+    const next = String(baseUrl ?? '').replace(/\/+$/, '');
+    if (!next || next === this.baseUrl) return false;
+    this.baseUrl = next;
+    this.invalidateAuth();
+    return true;
   }
 
   /** 使当前 Cookie/launch token 失效；DSH 重启或 401 后会自动重新发现最新 token。 */
@@ -935,7 +1059,11 @@ export function createTurnCollector() {
     /** 处理一条 session/event，返回该事件是否终结了一个 turn（此时可取最终文本）。 */
     push(event) {
       if (event.type === 'turn/start') {
-        turns.set(event.data.turn, { text: '' });
+        turns.set(event.data.turn, {
+          text: '',
+          seenMessageIds: new Set(),
+          seenFallbackKeys: new Set(),
+        });
         return null;
       }
       if (event.type === 'assistant/chunk') {
@@ -946,6 +1074,23 @@ export function createTurnCollector() {
       if (event.type === 'assistant/message') {
         const t = turns.get(event.data.turn);
         if (!t) return null;
+        const message = event.data.message;
+        const messageId = message?.id ?? event.data.messageId;
+        if (typeof messageId === 'string' && messageId) {
+          // DSH reconnects/replays can redeliver the same completed assistant
+          // message inside one turn. Message ids are the identity; identical
+          // text from a different id is legitimately distinct.
+          if (t.seenMessageIds.has(messageId)) return null;
+          t.seenMessageIds.add(messageId);
+        } else {
+          // Fallback for older event shapes without ids: only collapse an
+          // identical payload within the same turn+step.
+          const fallbackKey = `${event.data.step ?? ''}:${createHash('sha256')
+            .update(JSON.stringify(message?.content ?? []))
+            .digest('hex')}`;
+          if (t.seenFallbackKeys.has(fallbackKey)) return null;
+          t.seenFallbackKeys.add(fallbackKey);
+        }
         for (const block of event.data.message?.content ?? []) {
           if (block?.type === 'text' && typeof block.text === 'string') t.text += block.text;
         }

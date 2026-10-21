@@ -26,6 +26,29 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const PROFILE = process.argv[2] || 'web';
 
+/**
+ * DSH profile 用 `!!js <expression>` 保存平台判断。js-yaml 的默认 schema
+ * 不认识这个业务标签，整份 profile 会因此被拒绝解析。
+ *
+ * 这里把表达式包成可原样写回的标量类型。不能删掉 `!!js` 再补回来：
+ * 那样会改变平台条件语义，也可能误伤用户自己的表达式。
+ */
+class DshJsExpression {
+  constructor(value) {
+    this.value = value;
+  }
+}
+
+const DSH_JS_TYPE = new yaml.Type('tag:yaml.org,2002:js', {
+  kind: 'scalar',
+  resolve: (value) => typeof value === 'string',
+  construct: (value) => new DshJsExpression(value),
+  instanceOf: DshJsExpression,
+  represent: (value) => value.value,
+});
+
+const DSH_YAML_SCHEMA = yaml.DEFAULT_SCHEMA.extend([DSH_JS_TYPE]);
+
 // A profile is a directory name, never a path (same boundary as DSH itself).
 if (PROFILE === '.' || PROFILE === '..' || PROFILE === 'node_modules'
     || /[\\/\x00-\x1f<>:"|?*]/.test(PROFILE) || /[. ]$/.test(PROFILE)) {
@@ -164,7 +187,7 @@ function prepareCordisPatch() {
     lines.splice(first, 1);
   }
   let doc;
-  try { doc = yaml.load(lines.join('\n')) ?? []; }
+  try { doc = yaml.load(lines.join('\n'), { schema: DSH_YAML_SCHEMA }) ?? []; }
   catch (error) { fatal(`failed to parse ${patchFile}; file unchanged: ${error.message}`); }
   if (!Array.isArray(doc)) fatal(`${patchFile} must contain a YAML array; file unchanged`);
   let removed = 0;
@@ -183,7 +206,9 @@ function prepareCordisPatch() {
     // Retain shared insert parents and their selectors/other operation fields.
     if (entries.length || Object.keys(operation).length > 1) kept.push({ ...operation, insert: entries });
   }
-  const text = (kept.length ? `${yaml.dump(kept, { lineWidth: -1, noRefs: true })}\n` : '') + mcpEntries();
+  const text = (kept.length
+    ? `${yaml.dump(kept, { schema: DSH_YAML_SCHEMA, lineWidth: -1, noRefs: true })}\n`
+    : '') + mcpEntries();
   return { patchFile, original, text, removed };
 }
 
@@ -298,7 +323,10 @@ function patchProfilePackage(links) {
       log(`package.json bundle added: ${name}`);
     }
   }
-  fs.writeFileSync(pkgFile, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+  const nextText = `${JSON.stringify(pkg, null, 2)}\n`;
+  const previousText = fs.existsSync(pkgFile) ? fs.readFileSync(pkgFile, 'utf8') : '';
+  if (previousText && previousText !== nextText) backupBeforeOverwrite(pkgFile);
+  fs.writeFileSync(pkgFile, nextText, 'utf8');
   log(`profile package.json ensured: ${pkgFile}`);
 }
 

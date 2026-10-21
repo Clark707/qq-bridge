@@ -179,6 +179,35 @@ await test('wait exposes new messages and grants only their actually observed cu
   assert.deepEqual(seqs(st.unread), []);
 }, { observe: true });
 
+await test('owner successful reply acknowledges the displayed inbound watermark', async ({ h, request }) => {
+  const ownerKey = 'private:123';
+  const ownerState = h.getSocialV2State(ownerKey);
+  h.appendSocialV2Message(ownerKey, 'owner', '现在好了吗', '现在好了吗', false, true, 'owner-msg-1', [], '123');
+  const read = await request('unread', { key: ownerKey, token: ownerState.agentToken });
+  assert.equal(read.status, 200);
+  assert.equal(read.data.readThroughSeq, 1);
+  const sent = await request('send-message', {
+    key: ownerKey,
+    token: ownerState.agentToken,
+    body: { messages: ['回复已送达'] },
+  });
+  assert.equal(sent.status, 200);
+  assert.equal(ownerState.unread.length, 0, '成功回复后 owner 私聊不应残留已经回答过的未读');
+  assert.equal(ownerState.lastReadThroughSeq, 1);
+});
+
+await test('ordinary wait returns already-unread messages instead of waiting for another batch', async ({ st, request, append }) => {
+  append('first pending message');
+  append('second pending message');
+  const waited = await request('wait', { body: { timeoutMs: 200, quietMs: 0 } });
+  assert.equal(waited.status, 200);
+  assert.equal(waited.data.arrived, true);
+  assert.equal(waited.data.timeout, false);
+  assert.deepEqual(seqs(waited.data.newMessages), [1, 2]);
+  assert.equal(waited.data.readThroughSeq, 2);
+  assert.ok(waited.data.waitedMs < 150, 'existing unread must be returned immediately');
+}, { observe: true });
+
 await test('another conversation token, pause, mode and allowlist guards still reject combined close', async ({ h, st, request, append }) => {
   append('protected conversation');
   await request('unread');
@@ -254,6 +283,8 @@ await test('combined close respects the separate mark-read and wake-config tool 
 await test('an in-flight wait cannot authorize new messages after its session token is retired', async ({ h, st, request, append }) => {
   await h.ensureSession(KEY);
   append('before wait');
+  const read = await request('unread');
+  await request('mark-read', { body: { throughSeq: read.data.readThroughSeq } });
   const oldToken = st.agentToken;
   const waiting = request('wait', { body: { timeoutMs: 1000, quietMs: 0 }, token: oldToken });
   const timer = setTimeout(() => { h.retireSession(KEY); append('arrived after token retirement'); }, 60);
@@ -267,6 +298,8 @@ await test('an in-flight wait cannot authorize new messages after its session to
 
 await test('an in-flight wait cannot write observation into a replaced conversation state', async ({ h, st, request, append }) => {
   append('old state');
+  const read = await request('unread');
+  await request('mark-read', { body: { throughSeq: read.data.readThroughSeq } });
   const waiting = request('wait', { body: { timeoutMs: 100, quietMs: 0 } });
   const timer = setTimeout(() => {
     h.socialV2.conversations.delete(KEY);
@@ -283,6 +316,8 @@ await test('an in-flight wait cannot write observation into a replaced conversat
 
 await test('an in-flight wait rechecks mode permission before exposing a new arrival', async ({ h, request, append }) => {
   append('before mode change');
+  const read = await request('unread');
+  await request('mark-read', { body: { throughSeq: read.data.readThroughSeq } });
   const waiting = request('wait', { body: { timeoutMs: 1000, quietMs: 0 } });
   const timer = setTimeout(() => { h.setMode('chat'); append('after mode change'); }, 60);
   let result;
@@ -308,6 +343,8 @@ await test('building a budgeted snapshot preserves whole oldest messages without
 
 await test('an in-flight wait rechecks paused, feature, tool and allowlist permissions without granting observation', async ({ h, st, request, append }) => {
   append('unread before policy changes');
+  const read = await request('unread');
+  await request('mark-read', { body: { throughSeq: read.data.readThroughSeq } });
   const cases = [
     ['pause', () => { h.socialV2.paused = true; }, () => { h.socialV2.paused = false; }],
     ['feature disable', () => { h.cfg.socialV2.enabled = false; }, () => { h.cfg.socialV2.enabled = true; }],

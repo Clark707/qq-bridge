@@ -39,7 +39,7 @@
 > 默认分支 `main` **就是**本版本，`git clone` 直接拿到，无需切换分支。
 
 ```
-QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──► DSH Web API (127.0.0.1:3080/api)
+QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──► DSH Web API（动态发现 / 3080 仅为候选）
                                                 ▲                      │
                                                 └── agent 回复/提问/审批 ┘
 ```
@@ -53,7 +53,7 @@ QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──�
 ## 架构
 
 - **QQ 侧**：`@snowluma/sdk` 的 `SnowLumaWebSocketClient`（OneBot v11 WebSocket 客户端，自动重连）
-- **DSH 侧**：适配 DSH 0.1.2 起引入、**0.2.0-rc.2 上逐项复核**的协议——用本机持久化签名密钥铸造会话 Cookie 鉴权、`/api/<namespace>/<method>` 斜杠 RPC、`/api/remote.mux` + `session/follow` 事件流（`session/control` 的队列读 `value.projections[<id>].values.inbox`，另有一元 `session/projections` 主路径）；复用 `AbstractApiClient` 传输层但不再依赖旧版 zod value schema。会话模型由桥接按 `config.json` 的 `dsh.model` 逐会话 `session.selectModel` 固定（默认 `deepseek-flash` = DeepSeek-V41-Flash，多模态）
+- **DSH 侧**：适配 DSH 0.1.2 起引入、**0.2.1-rc.2 上逐项复核**的协议——用本机持久化签名密钥铸造会话 Cookie 鉴权、`/api/<namespace>/<method>` 斜杠 RPC、`/api/remote.mux` + `session/follow` 事件流（`session/control` 的队列读 `value.projections[<id>].values.inbox`，另有一元 `session/projections` 主路径）；复用 `AbstractApiClient` 传输层但不再依赖旧版 zod value schema。会话模型由桥接按 `config.json` 的 `dsh.model` 逐会话 `session.selectModel` 固定（默认 `deepseek-flash` = DeepSeek-V41-Flash，多模态）。desktop 壳的 API 端口每次启动动态分配：桥接先按 DSH 进程认领监听端口，再用 Cookie 鉴权和 `agentPresets/list` 复核；DSH 重启换端口会自动重新发现。`DSH_BASE_URL` 是显式硬覆盖，存在时失败也不会改连另一份 DSH。
 - **agent 自主收发 QQ**：DSH 的 MCP 客户端（`~/.dsh/profiles/web/cordis.patch.yml` 配置）接入三个 MCP server：
   - `snowluma`（桥接自带 `src/mcp-snowluma-safe.js`）：QQ 动作**安全子集**（查状态/查群/查消息/发消息，发送强制白名单；发送工具支持可选 `replyToMessageId` 引用回复）
   - `snowluma-host`（桥接自带 `src/mcp-host-server.js`）：**只有** `snowluma_status`（只读探活 `get_login_info`）。
@@ -85,13 +85,21 @@ QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──�
   - 支持 DSH 斜杠命令（如 `/model`）与 `/reset`（重置会话上下文）
   - 群聊引用/回复会解析成「被引用人 + 原文」注入 DSH（如 `[引用 Derp：El Psy Kongroo是啥]机关的走狗`），让 AI 判断这句话是对谁说的，不会把群友之间引用第三方的对话误当成指向自己；引用机器人自己时会被视为必回
   - **图片/表情（含动图 GIF）**：表情包优先走 QQ 的 CDN 直链，`get_image` 失败时用 `emoji_id` 推出 CDN 地址兜底；媒体元数据保留 `emoji_id`/`summary`/`sub_type` 等字段。下载走同一套 SSRF 防护传输，并修掉了「DNS 先返回 IPv6、本机没有 IPv6 出口 → 每次白等 20 秒」的根因（改为 **IPv4 优先 + 逐地址故障切换**），动图表情不再时好时坏。单条消息上限默认 8MB / 64MP / 5 张（`socialV2.media`）
+  - **语音、视频与动图入站证据**：语音先调用 SnowLuma 原生 `fetch_ptt_text`，6 秒未返回就取 WAV 交给本地 faster-whisper；视频由本地 ffmpeg 抽取最多 16 帧和音轨，GIF 额外抽最多 4 个关键帧，均作为图像内容进入模型。上限默认 5 分钟 / 20MB / 16 帧（`socialV2.media.inbound`）。媒体富化走独立单飞队列，不阻塞其他会话的文本收发
+  - **真实 QQ 系统表情**：模型文本里的 `[旺柴]`、`[doge]` 等名称从 SnowLuma `fetch_sys_faces` 目录映射成 `face` 段；目录不可用时按普通文本发送。未知 `[xxx]` 不会被猜测成表情
+  - **卡片与链接投影**：`json` 卡片只提取标题、说明和链接，不再只给模型一个 `[卡片消息]`
+  - **按需记忆证据**：每轮投递前按当前问题请求 LAAP `/v1/memory/evidence`，把带日期、层和出处的证据放入本轮；检索失败或没有命中时正常继续，不伪造记忆
+  - **跨壳长期纠正**：owner 私聊中的明确长期规则会先写入 LAAP `self_beliefs`，带 QQ message id 与会话出处；同一规则在桌面/飞书/QQ 之间去重共享，不复制成各会话私有的人格
+  - **运行时能力状态**：真实语音发送并回读成功后，把 messageId、时长和验证时间写入会话能力状态；旧对话若说“不能用”，以最近真实工具结果为准。旧能力事实通过 LAAP supersede 失效，历史经历保留
+  - **渠道归一记忆**：QQ 只是入口；QQ/飞书/DSH 回合进入同一 LAAP episodes，`details.channel` 只记 provenance，同一 `source_ref` 幂等合并，不建第二记忆库
+  - **图片/收藏表情/合成图发送**：`qq_list_images` 列本地图片库，`qq_compose_image` 生成 PNG 并返回预览，`qq_send_image` 在 `intent` / `expected` 自审后发送；发送后用 `get_msg` 回读 `image` 段，只有 `verified=true` 才算送达。链路见 [docs/qq-image-pipeline.md](docs/qq-image-pipeline.md)
   - MCP 发送工具支持可选 `replyToMessageId`，并新增专用 `qq_reply` 工具：AI 可以先用 `qq_get_group_history` 拿到真实消息 id，再引用/回复某条消息（是否允许 AI 主动使用由人格/策略决定；桥接会检测发送类工具调用并自动跳过该回合的重复自动转发）
   - 一代仿真模式（`reserved`）下，AI 可以只输出 `[SILENT]` 表示“潜水/不接话”，桥接会静默不发送
   - 一代仿真模式（`reserved`）按空格分句：AI 用空格表示拆成多条消息；中英文/数字之间的空格也会被当成分条信号，不想分条就不要加空格（`reserved2` 不适用，分条请用 `qq_send_message` 数组）
 
 ## 前置条件
 
-1. 运行中的 DeepSeek Harness Web（默认 `http://127.0.0.1:3080`）
+1. 运行中的 DeepSeek Harness Web。端口可动态变化；`http://127.0.0.1:3080` 只是默认候选
 2. 运行中的 SnowLuma，且配置好 OneBot WebSocket 与 HTTP API（默认 `ws://127.0.0.1:3001` / `http://127.0.0.1:3000`，`accessToken` 视配置填写）
 3. Node.js ≥ 22.13
 
@@ -109,7 +117,7 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 
 | 字段 | 说明 |
 | --- | --- |
-| `dsh.baseUrl` | DSH Web 地址，默认 `http://127.0.0.1:3080` |
+| `dsh.baseUrl` | DSH 优先候选地址，默认 `http://127.0.0.1:3080`。桥接会用 DSH 鉴权 RPC 复核，desktop 动态端口变化时会自动重新发现；环境变量 `DSH_BASE_URL` 可作显式硬覆盖 |
 | `dsh.provider` / `dsh.model` / `dsh.reasoningEffort` | DSH 会话使用的模型/推理强度；若你的 DSH 没有示例中的模型，改成 DSH 设置页里可用的模型即可（选择失败只打日志，不阻塞启动） |
 | `dsh.authToken` | DSH launch token（进程启动凭据）。**通常应留空**：留空时桥接用 `~/.dsh/.credentials.yaml` 里持久化的签名密钥**离线铸造**会话 Cookie，不依赖任何进程期状态（DSH 0.1.7 起启动 token 只存在于内存、日志里那条是上一个进程的陈旧值，换 Cookie 只会 401）。只有显式填了才会优先走 token 交换 |
 | `dsh.authHeader` / `dsh.authPrefix` | 保留字段，当前新版 DSH 链路使用 Cookie 交换，不再直接发送该鉴权头 |
@@ -122,7 +130,10 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 | `agentPreset` | QQ 会话使用的 DSH agent preset，默认 `qq-chat`（改性格见下文） |
 | `socialV2.agentPreset` | `reserved2` 模式使用的 DSH agent preset，默认 `qq-chat-v2` |
 | `socialV2.initialPromptMaxChars` | 会话「初始提示词」（控制台为某个群/私聊预写的环境说明）的字数上限，默认 2000，允许 100~8000。越界值会在启动时收敛并保持原文件不动 |
-| `socialV2.media` | 图片/表情的上限：`maxBytes`（单条消息总字节，默认 8MB）、`maxPixels`（单张像素，默认 64MP）、`maxCount`（单条最多处理几张，默认 5）。越界值启动时收敛 |
+| `socialV2.media` | 图片/表情的上限：`maxBytes`（单条消息总字节，默认 8MB）、`maxPixels`（单张像素，默认 64MP）、`maxCount`（单条最多处理几张，默认 5）。`media.inbound` 另控语音/视频：`maxBytes`、`maxSeconds`、`maxFrames`、`modelPath`、`ffmpegPath`、`workDir` |
+| `socialV2.faces.enabled` | 是否把模型文本中的已知 QQ 系统表情名转成真实 `face` 段，默认开启；目录仍由网关实时提供 |
+| `memoryRetrieval` | 投递前的 LAAP 证据检索：`enabled`、`baseUrl`、`budget`、`maxChars`、`timeoutMs`。默认指向本机 11546，超时按无检索继续 |
+| `contextManagement` | 只读上下文预算监控：`warnRatio`、`criticalRatio`、`compactionRatio`、`retainTokens`。默认 30% 预警、38% 临界；压缩仍由 DSH 在 40% 执行并保留 64k |
 | `webSearch.provider` | 联网搜索后端：`auto`（默认，优先 DeepSeek、失败回退 Bing）/ `deepseek`（仅 DeepSeek，无凭据时报错）/ `bing` |
 | `webSearch.apiKeyEnv` / `apiKey` | 搜索凭据的环境变量名（默认 `DEEPSEEK_API_KEY`）/ 直接写死 key（不推荐）。都不设置时读 DSH 的 `$DSH_HOME/.credentials.yaml` 里同名 ref |
 | `webSearch.baseURL` / `model` / `maxUses` / `maxResults` | 搜索端点（默认 `https://api.deepseek.com/anthropic/v1`，必须 https 且解析到公网）、模型（默认 `deepseek-v4-flash`）、单次搜索最多用几次工具、返回条数上限 |
@@ -208,6 +219,7 @@ npm start          # 或双击 start.bat（守护模式：崩溃自动重启，�
 - **桥接只能运行一个实例**（有单实例锁，重复启动会被拒绝并提示"已有实例在运行"）
 - **用 start.bat 启动**（守护模式），窗口别关——桥接崩溃会在 5 秒后自动拉起
 - 桥接异常/消息无反应时：双击 `restart.bat`（自动杀旧实例 → 清理锁 → 重新启动守护）
+- **控制台 `/api/restart` 自拉起**：先保存状态，再由隐藏 WScript 等旧锁/端口释放后拉起；不再等下一次分钟轮询，计划任务仍作兜底
 - **重启 DSH 通常不需要动桥接**：每 5 秒探活，DSH 不可用期间收到的 QQ 消息在桥接进程内排队（最多 50 条/会话，满后丢最旧项），恢复后尝试补投。桥接进程退出会丢失内存队列；断线期间已经结束的回复暂不保证补发。
 - 修改 `config.json` / `roles/` / `state/current-role.json` 后重启桥接生效；修改 `dsh/agent-presets/`（改完要跑 `node scripts/build-agent-preset-patches.mjs` 重新生成 bundle patch）或 MCP 配置后重启 DSH 生效
 

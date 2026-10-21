@@ -13,6 +13,17 @@ const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const parserRoot = process.env.QQ_BRIDGE_TEST_YAML_ROOT || path.dirname(require.resolve('js-yaml/package.json'));
 const yaml = (await import(pathToFileURL(path.join(parserRoot, 'dist/js-yaml.mjs')).href)).default;
+class JsExpression {
+  constructor(value) { this.value = value; }
+}
+const jsExpressionType = new yaml.Type('tag:yaml.org,2002:js', {
+  kind: 'scalar',
+  resolve: (value) => typeof value === 'string',
+  construct: (value) => new JsExpression(value),
+  instanceOf: JsExpression,
+  represent: (value) => value.value,
+});
+const dshSchema = yaml.DEFAULT_SCHEMA.extend([jsExpressionType]);
 const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-bridge-audit-setup-'));
 let failures = 0;
 
@@ -73,6 +84,30 @@ try {
     const result = f.run();
     assert.equal(result.status, 0, result.stderr);
     assert.equal(yaml.load(fs.readFileSync(f.patchFile, 'utf8'))[0].insert[0].config.text, '[]\nkeep me\n');
+  });
+
+  test('DSH !!js expressions survive setup and managed entries are still normalized', () => {
+    const f = fixture('dsh-js-tag', [
+      '# DSH platform condition',
+      '- id: existing-platform-entry',
+      '  name: example.plugin',
+      '  config:',
+      "    disabled: !!js process.platform === 'win32'",
+      '- insert:',
+      '    - id: mcp-snowluma',
+      '      name: old',
+      '',
+    ].join('\n'));
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    const text = fs.readFileSync(f.patchFile, 'utf8');
+    assert.match(text, /disabled: !!js process\.platform === 'win32'/);
+    const doc = yaml.load(text, { schema: dshSchema });
+    assert.ok(doc[0].config.disabled instanceof JsExpression);
+    assert.equal(doc[0].config.disabled.value, "process.platform === 'win32'");
+    const entries = doc.flatMap((op) => op.insert || []);
+    assert.equal(entries.filter((entry) => entry.id === 'mcp-snowluma').length, 1);
+    assert.equal(entries.find((entry) => entry.id === 'mcp-snowluma').config.toolCallTimeoutMs, 725000);
   });
 
   test('malformed patch fails before replacing user configuration or presets', () => {

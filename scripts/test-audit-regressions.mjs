@@ -108,6 +108,7 @@ await test('R2 send-burst 失败路径不再抛 ReferenceError，并回滚发送
   try {
     h.setMode('reserved2');
     const st = h.getSocialV2State('group:456');
+    st.lastIncomingAt = Date.now();
     const before = st.sendTimes.length;
     await withServer(h, async (port) => {
       const res = await call(port, '/api/socialV2/send-burst', {
@@ -432,6 +433,141 @@ await test('R16 appendSocialV2Message 保留 kind/emojiId/summary/subType', asyn
     assert.ok(dirty.length <= 60, `摘要必须限长（实得 ${dirty.length}）`);
     // 兜底地址仍然能从落库后的字段推出来（这是 fetchOneBotImage 的实际输入）。
     assert.match(String(h.emojiCdnCandidates(stored.media[0].emojiId)[0] ?? ''), /gxh\.vip\.qq\.com/, '落库字段应足以推出 CDN 兜底地址');
+  } finally { await h.close(); }
+});
+
+// ── R17. owner 私聊不是自主打扰：人类消息不得被自主唤醒配额挡住 ──────────────
+await test('R17 owner 私聊消息绕过自主唤醒限频，繁忙暂存仍保留', async () => {
+  const h = await bridgeHarness({
+    savedState: { sessions: { 'private:123': 's-owner' }, sessionPolicies: {} },
+    config: { socialV2: { wake: { maxWakePerMinute: 1, maxWakePerHour: 1 } } },
+  });
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State('private:123');
+    st.wakeTimes = [Date.now()];
+    st.unread = [{ seq: 1, sender: '老大', text: '在吗', time: Date.now() }];
+    st.lastUnreadSeq = 1;
+    const before = h.calls.prompts.length;
+    await h.sendWakePromptV2('private:123', 'private');
+    assert.equal(h.calls.prompts.length, before + 1, 'owner 明确发来的消息必须立即进入投递链');
+    assert.equal(st.rateLimitRetryTimer, null, 'owner 直连唤醒不得留下延迟重试定时器');
+  } finally { await h.close(); }
+});
+
+// ── R18. owner 未读优先：群聊自主扫描和回复检查必须让路 ──────────────────────
+await test('R18 owner 私聊有未读时，群聊自主与回复检查暂停', async () => {
+  const h = await bridgeHarness();
+  try {
+    h.setMode('reserved2');
+    const owner = h.getSocialV2State('private:123');
+    const group = h.getSocialV2State('group:456');
+    owner.unread = [{ seq: 7, sender: '老大', text: '先回我', time: Date.now() }];
+    group.proactiveTimer = setTimeout(() => {}, 60_000);
+    group.replyCheckTimer = setTimeout(() => {}, 60_000);
+    assert.equal(h.ownerPrivateNeedsAttentionV2(), true);
+    assert.equal(h.yieldGroupToOwnerV2('group:456', 'test'), true);
+    assert.equal(group.proactiveTimer, null, '群自主扫描必须让路');
+    assert.equal(group.replyCheckTimer, null, '群回复检查必须让路');
+    assert.equal(h.yieldGroupToOwnerV2('private:123', 'test'), false, '私聊自身不受此暂停规则影响');
+  } finally { await h.close(); }
+});
+
+// ── R19. 意图领取携带 owner_private，LAAP 才能只把无会话承诺给 owner ─────────
+await test('R19 initiative claim 明确标记 owner_private，群聊不得冒充 owner', async () => {
+  const seen = [];
+  const h = await bridgeHarness({
+    savedState: {
+      sessions: { 'private:123': 's-owner', 'group:456': 's-group' },
+      sessionPolicies: {},
+    },
+    globals: {
+      fetch: async (url, init = {}) => {
+        seen.push({ url: String(url), body: JSON.parse(init.body ?? '{}') });
+        return { ok: true, status: 200, json: async () => ({ ok: true, opportunity: null }) };
+      },
+    },
+  });
+  try {
+    h.setMode('reserved2');
+    await h.claimInitiativeV2('private:123', h.getSocialV2State('private:123'));
+    await h.claimInitiativeV2('group:456', h.getSocialV2State('group:456'));
+    const claims = seen.filter((x) => x.url.endsWith('/v1/initiative/claim'));
+    assert.equal(claims.length, 2);
+    assert.equal(claims[0].body.owner_private, true);
+    assert.equal(claims[1].body.owner_private, false);
+  } finally { await h.close(); }
+});
+
+await test('R20 QQ 工具发送参数可提取为真实回复正文', async () => {
+  const h = await bridgeHarness();
+  try {
+    const text = h.outboundTextFromToolCall(
+      'mcp__snowluma__qq_send_message',
+      JSON.stringify({ key: 'private:123', messages: ['第一句', '第二句'] }),
+    );
+    assert.equal(text, '第一句\n第二句');
+    assert.equal(h.outboundTextFromToolCall('mcp__snowluma__qq_send_sticker', JSON.stringify({ key: 'private:123' })), '');
+  } finally { await h.close(); }
+});
+
+await test('R21 QQ 回合把真实输入和工具回复写成同一条渠道 episode', async () => {
+  const requests = [];
+  const h = await bridgeHarness({
+    globals: {
+      fetch: async (url, init = {}) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body ?? '{}') });
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      },
+    },
+  });
+  try {
+    h.turnInputBySession.set('s-owner', [
+      { sender: '私聊', text: '你消息发到哪去了', isOwner: true },
+    ]);
+    await h.postQueueEpisodeV2(
+      'private:123',
+      's-owner',
+      17,
+      'completed',
+      '发在私聊，没有发到群里',
+    );
+    const episode = requests.find((x) => x.url.endsWith('/v1/memory/episode'));
+    assert.ok(episode, '必须调用渠道 episode 写端');
+    assert.equal(episode.body.details.channel, 'qq');
+    assert.equal(episode.body.details.target, 'private:123');
+    assert.equal(episode.body.source_ref, 's-owner:17');
+    assert.match(episode.body.summary, /你消息发到哪去了/);
+    assert.match(episode.body.summary, /发在私聊，没有发到群里/);
+  } finally { await h.close(); }
+});
+
+await test('R22 owner 未指定群号时不能把“去群里”猜成某个群', async () => {
+  const h = await bridgeHarness();
+  try {
+    h.setMode('reserved2');
+    const owner = h.getSocialV2State('private:123');
+    const group = h.getSocialV2State('group:456');
+    group.lastIncomingAt = 0;
+    group.unread = [];
+    group.initiativeClaim = null;
+    owner.recentMessages = [{
+      text: '你去群里撒野看看，我点评',
+      isOwner: true,
+      time: Date.now(),
+    }];
+    assert.equal(h.groupSendScopeAllowedV2('group:456'), false, '模糊指令不得授权任意群');
+
+    owner.recentMessages.push({
+      text: '去 group:456 看看',
+      isOwner: true,
+      time: Date.now(),
+    });
+    assert.equal(h.groupSendScopeAllowedV2('group:456'), true, '明确群号才授权跨群发送');
+
+    owner.recentMessages = [];
+    group.lastIncomingAt = Date.now();
+    assert.equal(h.groupSendScopeAllowedV2('group:456'), true, '群会话自己刚收到消息时可直接回复');
   } finally { await h.close(); }
 });
 

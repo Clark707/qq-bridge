@@ -2047,6 +2047,8 @@ button:active:not(:disabled) {
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendSticker"> <span><b>qq_send_sticker</b><span class="meta">发送收藏表情（一条消息只能一张，不能带文字）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="collectSticker"> <span><b>qq_collect_sticker</b><span class="meta">AI 偶尔收藏别人发的表情并写简短备注</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getSelfImage"> <span><b>qq_get_self_image</b><span class="meta">查看自己的默认 Q 版形象图片</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendImage"> <span><b>qq_list_images / qq_compose_image / qq_send_image</b><span class="meta">列图、合成图、自审后发送本地图片，并回读 QQ 消息确认落地</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="scheduleIntention"> <span><b>qq_schedule_intention</b><span class="meta">登记具体的未来主动意图；到期且有真实内容时才叫醒</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="stickerNote"> <span><b>qq_sticker_note</b><span class="meta">给表情记录本地含义/标签/用法</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="setStickerRemark"> <span><b>qq_set_sticker_remark</b><span class="meta">修改 QQ 官方表情备注（默认禁用，慎用）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendVoice"> <span><b>qq_send_voice / qq_list_voices</b><span class="meta">发送语音条（只能发语音库里的音频；偶然而为的强表达）</span></span></label>
@@ -2172,18 +2174,20 @@ button:active:not(:disabled) {
       </div>
 
       </div></details>
-<details class="settings-group"><summary>主动机会参数（proactive：群安静时 AI 主动冒泡）</summary><div class="settings-content">
+<details class="settings-group"><summary>主动念头与机会（共享意图账本）</summary><div class="settings-content">
       <div class="row">
-        <label style="flex:1">启用主动机会</label><input type="checkbox" id="v2ProactiveEnabled" style="width:auto">
-        <label style="flex:1">检查间隔（分）</label>
-        <input type="number" id="v2ProactiveIntervalMin" min="1" style="width:80px"> ~
-        <input type="number" id="v2ProactiveIntervalMax" min="1" style="width:80px">
+        <label style="flex:1">启用意图扫描</label><input type="checkbox" id="v2ProactiveEnabled" style="width:auto">
+        <label style="flex:1">扫描周期（秒）</label><input type="number" id="v2ProactiveScanSec" min="60" max="300" style="width:90px">
       </div>
-      <div class="row">
-        <label style="flex:1">安静阈值（分）</label><input type="number" id="v2ProactiveIdleThreshold" min="1" style="width:80px">
-        <label style="flex:1">触发概率</label><input type="number" id="v2ProactiveProbability" step="0.05" min="0" max="1" style="width:80px">
+      <div class="meta" style="margin:8px 0">
+        扫描器只检查已经形成的念头、未闭环下一步、刚完成的事或她明确记下的未来意图；没有具体理由就不生成消息。
+        全天允许，不设夜间静默；断网或 QQ 不在线时不领取，恢复后重新判断。发送成功、主动跳过和消息 id 都写回同一本账。
       </div>
-
+      <div class="row" style="align-items:center;gap:8px">
+        <button id="v2InitiativeLoad" type="button" class="small">查看共享账本</button>
+        <span id="v2InitiativeMsg" class="meta"></span>
+      </div>
+      <pre id="v2InitiativeOutput" class="tool-log-output" style="max-height:260px;overflow:auto">尚未加载</pre>
       </div></details>
 <details class="settings-group"><summary>表情包参数（sticker：QQ 收藏表情体系）</summary><div class="settings-content">
       <div class="row">
@@ -3318,10 +3322,7 @@ async function loadV2Config() {
     document.getElementById('v2AutoReplyCheckSec').value = Math.round((c.autoReplyCheckMs || 30000) / 1000);
     const pa = c.proactive || {};
     document.getElementById('v2ProactiveEnabled').checked = pa.enabled !== false;
-    document.getElementById('v2ProactiveIntervalMin').value = Math.round((pa.checkIntervalMinMs || 1800000) / 60000);
-    document.getElementById('v2ProactiveIntervalMax').value = Math.round((pa.checkIntervalMaxMs || 5400000) / 60000);
-    document.getElementById('v2ProactiveIdleThreshold').value = Math.round((pa.idleThresholdMs || 900000) / 60000);
-    document.getElementById('v2ProactiveProbability').value = pa.probability ?? 0.3;
+    document.getElementById('v2ProactiveScanSec').value = Math.round((pa.scanIntervalMs || 60000) / 1000);
     const stk = c.sticker || {};
     document.getElementById('v2StickerEnabled').checked = stk.enabled !== false;
     document.getElementById('v2StickerSyncTtlSec').value = Math.round((stk.syncTtlMs || 60000) / 1000);
@@ -3399,10 +3400,7 @@ async function saveV2Config() {
     },
     proactive: {
       enabled: document.getElementById('v2ProactiveEnabled').checked,
-      checkIntervalMinMs: Math.round(Number(document.getElementById('v2ProactiveIntervalMin').value) || 30) * 60000,
-      checkIntervalMaxMs: Math.round(Number(document.getElementById('v2ProactiveIntervalMax').value) || 90) * 60000,
-      idleThresholdMs: Math.round(Number(document.getElementById('v2ProactiveIdleThreshold').value) || 15) * 60000,
-      probability: Number(document.getElementById('v2ProactiveProbability').value) || 0
+      scanIntervalMs: Math.min(300, Math.max(60, Math.round(Number(document.getElementById('v2ProactiveScanSec').value) || 60))) * 1000
     },
     sticker: {
       enabled: document.getElementById('v2StickerEnabled').checked,
@@ -3840,6 +3838,34 @@ document.getElementById('v2SessionSelect').addEventListener('change', (ev) => {
 
 document.getElementById('v2ConfigSave').addEventListener('click', saveV2Config);
 document.getElementById('v2ConfigSaveTop').addEventListener('click', saveV2Config);
+document.getElementById('v2InitiativeLoad').addEventListener('click', async () => {
+  const msg = document.getElementById('v2InitiativeMsg');
+  const out = document.getElementById('v2InitiativeOutput');
+  msg.textContent = '加载中…';
+  msg.className = 'meta';
+  try {
+    const r = await api('/api/socialV2/initiative');
+    if (!r.ok) throw new Error(r.error || '共享账本读取失败');
+    const counts = r.counts || {};
+    const policy = r.policy || {};
+    const limits = policy.daily_limit || {};
+    const recent = Array.isArray(r.recent) ? r.recent : [];
+    const lines = [
+      `状态：available ${counts.available || 0}｜claimed ${counts.claimed || 0}｜sent ${counts.sent || 0}｜skipped ${counts.skipped || 0}`,
+      `每日上限：QQ ${limits.qq ?? '-'}｜飞书 ${limits.feishu ?? '-'}｜最短间隔 ${Math.round((policy.min_gap_seconds || 0) / 60)} 分钟`,
+      `静默时段：${policy.quiet_hours == null ? '无（全天）' : policy.quiet_hours}｜离线：${policy.offline_policy || '-'}`,
+      '',
+      ...recent.map((x) => `[${x.status}] ${x.source} · ${String(x.reason || '').slice(0, 180)}${x.message_id ? ` · ${x.message_id}` : ''}`)
+    ];
+    out.textContent = lines.join('\n');
+    msg.textContent = '已刷新';
+    msg.className = 'meta ok';
+  } catch (error) {
+    out.textContent = '';
+    msg.textContent = '❌ ' + (error?.message || error);
+    msg.className = 'meta err';
+  }
+});
 document.getElementById('voiceRefreshBtn').addEventListener('click', () => loadVoiceLibrary(true));
 document.getElementById('voiceSendBtn').addEventListener('click', sendVoiceFromConsole);
 async function refreshV2Activity() {

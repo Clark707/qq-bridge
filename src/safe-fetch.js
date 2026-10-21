@@ -360,8 +360,13 @@ export function looksLikeImageBuffer(buf) {
   return false;
 }
 
-/** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
-export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
+/**
+ * 抓取任意二进制内容并返回 Buffer（仍执行完整的 URL/重定向/SSRF 校验）。
+ *
+ * 入站语音、视频和后续本地转码都需要原始字节。此前只有图片版本，导致媒体
+ * 链路要么复制一套不完整的抓取代码，要么绕过安全边界直接 fetch，两者都不可取。
+ */
+export async function safeFetchBytes(urlString, maxBytes = 20 * 1024 * 1024) {
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
   let { url, addresses } = await validateFetchUrl(urlString);
@@ -374,12 +379,18 @@ export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
       continue;
     }
     if (result.statusCode < 200 || result.statusCode >= 300) {
-      throw new Error(`图片抓取失败：HTTP ${result.statusCode}`);
-    }
-    if (!looksLikeImageBuffer(result.buffer)) {
-      throw new Error(`抓取内容不是有效图片（PNG/JPEG/GIF/WebP）`);
+      throw new Error(`媒体抓取失败：HTTP ${result.statusCode}`);
     }
     return { url: url.toString(), statusCode: result.statusCode, buffer: result.buffer };
   }
   throw new Error('重定向次数过多，已停止');
+}
+
+/** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
+export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
+  const result = await safeFetchBytes(urlString, maxBytes);
+  if (!looksLikeImageBuffer(result.buffer)) {
+    throw new Error('抓取内容不是有效图片（PNG/JPEG/GIF/WebP）');
+  }
+  return result;
 }
