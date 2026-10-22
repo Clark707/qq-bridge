@@ -24,6 +24,7 @@
     "test:images": "node scripts/test-images.mjs",
     "test:qq-guard": "node scripts/test-qq-guard.mjs",
     "test:issues": "node scripts/test-issue-regressions.mjs",
+    "test:system-errors": "node scripts/test-system-error-policy.mjs",
     "test-wait:e2e": "node scripts/test-dsh-v2-wait.mjs",
     "test-vision": "node scripts/test-vision-media.mjs",
     "test-forward": "node scripts/test-forward.mjs",

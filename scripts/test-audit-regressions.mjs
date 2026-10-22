@@ -18,6 +18,12 @@
 //   R14 token 账本：被淘汰采样被新基线覆盖后不得重复计费
 //   R15 /api/send/* 失败路径的 st/now 越界（与 R2 同型，残留在这条旧发送工具真正走的端点）
 //   R16 reserved2 消息落库不得丢 kind/emojiId/summary/subType（表情 CDN 兜底与标签全靠它）
+//   R23 replyCheck 没有新入站消息时不得凭空叫醒模型补发
+//   R24 agent 在同一回合可以继续补充不同文本；限频仍由发送预算负责
+//   R25 owner 私聊可作为操作者向未进入环境白名单的明确目标发送
+//   R26 owner 跨目标图片通道与普通会话令牌隔离
+//   R27 旧发送工具也遵守 owner 跨目标语义
+//   R28 已加载的旧版 MCP 工具不带 ownerKey 时，owner 令牌仍能按目标操作
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -433,6 +439,180 @@ await test('R16 appendSocialV2Message 保留 kind/emojiId/summary/subType', asyn
     assert.ok(dirty.length <= 60, `摘要必须限长（实得 ${dirty.length}）`);
     // 兜底地址仍然能从落库后的字段推出来（这是 fetchOneBotImage 的实际输入）。
     assert.match(String(h.emojiCdnCandidates(stored.media[0].emojiId)[0] ?? ''), /gxh\.vip\.qq\.com/, '落库字段应足以推出 CDN 兜底地址');
+  } finally { await h.close(); }
+});
+
+// ── R23. replyCheck：没人回复时不得凭空开始新一轮 ───────────────────────────
+await test('R23 无新入站的 replyCheck 不唤醒模型补发', async () => {
+  const h = await bridgeHarness({
+    config: { socialV2: { autoReplyCheckMs: 20, proactive: { enabled: false } } },
+  });
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State('private:123');
+    st.unread = [];
+    st.recentMessages = [
+      { isSelf: false, time: Date.now() - 2_000, text: '在吗' },
+      { isSelf: true, time: Date.now() - 1_000, text: '在。' },
+    ];
+    const before = h.calls.prompts.length;
+    h.scheduleReplyCheckV2('private:123');
+    assert.ok(st.replyCheckTimer, '应建立检查定时器，而不是立刻发');
+    await sleep(60);
+    assert.equal(h.calls.prompts.length, before, '没有新入站时不应产生模型回合');
+  } finally { await h.close(); }
+});
+
+// ── R24. 同一回合可以继续补充不同文本 ───────────────────────────────────────
+await test('R24 同一回合可继续发送不同文本', async () => {
+  const h = await bridgeHarness({
+    config: { socialV2: { autoReplyCheckMs: 3_600_000, proactive: { enabled: false } } },
+  });
+  try {
+    h.setMode('reserved2');
+    const key = 'private:123';
+    h.state.sessions[key] = 'session-message-loop';
+    const st = h.getSocialV2State(key);
+    await withServer(h, async (port) => {
+      const first = await call(port, '/api/socialV2/send-message', {
+        method: 'POST',
+        token: st.agentToken,
+        body: { key, messages: ['第一段'] },
+      });
+      assert.equal(first.status, 200, first.body);
+      const second = await call(port, '/api/socialV2/send-message', {
+        method: 'POST',
+        token: st.agentToken,
+        body: { key, messages: ['又想到一句，接着说'] },
+      });
+      assert.equal(second.status, 200, second.body);
+      assert.equal(second.json?.sent, 1);
+    });
+  } finally { await h.close(); }
+});
+
+// ── R25. owner 私聊是账号操作者，不是只能回复自己的会话 ─────────────────────
+await test('R25 owner 私聊可向未进入环境白名单的明确目标发送', async () => {
+  const h = await bridgeHarness({
+    config: { socialV2: { autoReplyCheckMs: 3_600_000, proactive: { enabled: false } } },
+  });
+  try {
+    h.setMode('reserved2');
+    const ownerKey = 'private:123';
+    const target = 'group:999';
+    h.state.sessions[ownerKey] = 'session-owner-targeting';
+    const owner = h.getSocialV2State(ownerKey);
+    await withServer(h, async (port) => {
+      const sent = await call(port, '/api/socialV2/send-message', {
+        method: 'POST',
+        token: owner.agentToken,
+        headers: { 'x-owner-key': ownerKey },
+        body: { key: target, messages: ['这是 owner 明确指定的目标'] },
+      });
+      assert.equal(sent.status, 200, sent.body);
+      assert.equal(sent.json?.sent, 1);
+    });
+    assert.ok(
+      h.calls.http.some((entry) => String(entry.url).endsWith('/send_group_msg')
+        && String(entry.body?.group_id) === '999'),
+      'owner 指定目标必须真的发送，而不是被环境白名单挡住',
+    );
+  } finally { await h.close(); }
+});
+
+// ── R26. owner 的媒体通道同样按“操作者 + 明确目标”工作 ─────────────────────
+await test('R26 owner 跨目标图片通道可用，普通会话令牌不能冒充', async () => {
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-bridge-r26-'));
+  const image = path.join(fixtureDir, 'fixture.png');
+  fs.writeFileSync(
+    image,
+    Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k3ioAAAAASUVORK5CYII=', 'base64'),
+  );
+  const h = await bridgeHarness({
+    config: { socialV2: { autoReplyCheckMs: 3_600_000, proactive: { enabled: false } } },
+  });
+  try {
+    h.setMode('reserved2');
+    const ownerKey = 'private:123';
+    const target = 'group:999';
+    h.state.sessions[ownerKey] = 'session-owner-media';
+    const owner = h.getSocialV2State(ownerKey);
+    const foreign = h.getSocialV2State('group:456');
+    await withServer(h, async (port) => {
+      const ok = await call(port, '/api/socialV2/send-image', {
+        method: 'POST',
+        token: owner.agentToken,
+        headers: { 'x-owner-key': ownerKey },
+        body: {
+          key: target,
+          image,
+          dryRun: true,
+          review: { intent: '检查 owner 跨目标媒体权限', expected: '只验证不发送' },
+        },
+      });
+      assert.equal(ok.status, 200, ok.body);
+
+      const denied = await call(port, '/api/socialV2/send-image', {
+        method: 'POST',
+        token: foreign.agentToken,
+        headers: { 'x-owner-key': ownerKey },
+        body: {
+          key: target,
+          image,
+          dryRun: true,
+          review: { intent: '不能冒充 owner', expected: '拒绝' },
+        },
+      });
+      assert.equal(denied.status, 403, denied.body);
+    });
+  } finally {
+    await h.close();
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+// ── R27. 旧发送端点不能与新 owner 语义分叉 ─────────────────────────────────
+await test('R27 旧 /api/send/group 也支持 owner 明确目标', async () => {
+  const h = await bridgeHarness({
+    config: { socialV2: { autoReplyCheckMs: 3_600_000, proactive: { enabled: false } } },
+  });
+  try {
+    h.setMode('reserved2');
+    const ownerKey = 'private:123';
+    h.state.sessions[ownerKey] = 'session-owner-legacy-send';
+    const owner = h.getSocialV2State(ownerKey);
+    await withServer(h, async (port) => {
+      const sent = await call(port, '/api/send/group', {
+        method: 'POST',
+        token: owner.agentToken,
+        headers: { 'x-owner-key': ownerKey },
+        body: { groupId: '999', message: '旧发送工具按 owner 明确目标发送', token: owner.agentToken },
+      });
+      assert.equal(sent.status, 200, sent.body);
+      assert.equal(sent.json?.sent, 1);
+    });
+  } finally { await h.close(); }
+});
+
+// ── R28. owner 令牌本身就是账号级意图，兼容尚未热更新 ownerKey 的 MCP ────────
+await test('R28 owner 令牌不带 ownerKey 也能向明确目标发送', async () => {
+  const h = await bridgeHarness({
+    config: { socialV2: { autoReplyCheckMs: 3_600_000, proactive: { enabled: false } } },
+  });
+  try {
+    h.setMode('reserved2');
+    const ownerKey = 'private:123';
+    h.state.sessions[ownerKey] = 'session-owner-without-header';
+    const owner = h.getSocialV2State(ownerKey);
+    await withServer(h, async (port) => {
+      const sent = await call(port, '/api/socialV2/send-message', {
+        method: 'POST',
+        token: owner.agentToken,
+        body: { key: 'group:999', messages: ['owner 令牌直接指定目标'] },
+      });
+      assert.equal(sent.status, 200, sent.body);
+      assert.equal(sent.json?.sent, 1);
+    });
   } finally { await h.close(); }
 });
 

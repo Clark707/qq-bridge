@@ -55,7 +55,7 @@ QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──�
 - **QQ 侧**：`@snowluma/sdk` 的 `SnowLumaWebSocketClient`（OneBot v11 WebSocket 客户端，自动重连）
 - **DSH 侧**：适配 DSH 0.1.2 起引入、**0.2.1-rc.2 上逐项复核**的协议——用本机持久化签名密钥铸造会话 Cookie 鉴权、`/api/<namespace>/<method>` 斜杠 RPC、`/api/remote.mux` + `session/follow` 事件流（`session/control` 的队列读 `value.projections[<id>].values.inbox`，另有一元 `session/projections` 主路径）；复用 `AbstractApiClient` 传输层但不再依赖旧版 zod value schema。会话模型由桥接按 `config.json` 的 `dsh.model` 逐会话 `session.selectModel` 固定（默认 `deepseek-flash` = DeepSeek-V41-Flash，多模态）。desktop 壳的 API 端口每次启动动态分配：桥接先按 DSH 进程认领监听端口，再用 Cookie 鉴权和 `agentPresets/list` 复核；DSH 重启换端口会自动重新发现。`DSH_BASE_URL` 是显式硬覆盖，存在时失败也不会改连另一份 DSH。
 - **agent 自主收发 QQ**：DSH 的 MCP 客户端（`~/.dsh/profiles/web/cordis.patch.yml` 配置）接入三个 MCP server：
-  - `snowluma`（桥接自带 `src/mcp-snowluma-safe.js`）：QQ 动作**安全子集**（查状态/查群/查消息/发消息，发送强制白名单；发送工具支持可选 `replyToMessageId` 引用回复）
+  - `snowluma`（桥接自带 `src/mcp-snowluma-safe.js`）：QQ 动作子集（查状态/查群/查消息/发消息）。普通会话按聊天白名单；owner 私聊可用 `ownerKey=private:QQ号` 对明确目标执行账号级发送，`deny` 仍是目标禁用项。发送工具支持可选 `replyToMessageId` 引用回复
   - `snowluma-host`（桥接自带 `src/mcp-host-server.js`）：**只有** `snowluma_status`（只读探活 `get_login_info`）。
     ⚠️ **v0.1.5 起移除了 `start_snowluma` / `stop_snowluma`**（以及 `snowluma.allowProcessControl` 配置项）——
     原因是 **SnowLuma EULA §5.4** 规定「将其并入第三方安装包或 Docker 镜像、**通过自动化脚本部署**」
@@ -93,7 +93,7 @@ QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──�
   - **运行时能力状态**：真实语音发送并回读成功后，把 messageId、时长和验证时间写入会话能力状态；旧对话若说“不能用”，以最近真实工具结果为准。旧能力事实通过 LAAP supersede 失效，历史经历保留
   - **渠道归一记忆**：QQ 只是入口；QQ/飞书/DSH 回合进入同一 LAAP episodes，`details.channel` 只记 provenance，同一 `source_ref` 幂等合并，不建第二记忆库
   - **图片/收藏表情/合成图发送**：`qq_list_images` 列本地图片库，`qq_compose_image` 生成 PNG 并返回预览，`qq_send_image` 在 `intent` / `expected` 自审后发送；发送后用 `get_msg` 回读 `image` 段，只有 `verified=true` 才算送达。链路见 [docs/qq-image-pipeline.md](docs/qq-image-pipeline.md)
-  - MCP 发送工具支持可选 `replyToMessageId`，并新增专用 `qq_reply` 工具：AI 可以先用 `qq_get_group_history` 拿到真实消息 id，再引用/回复某条消息（是否允许 AI 主动使用由人格/策略决定；桥接会检测发送类工具调用并自动跳过该回合的重复自动转发）
+- MCP 发送工具支持可选 `replyToMessageId`，并新增专用 `qq_reply` 工具：AI 可以先用 `qq_get_group_history` 拿到真实消息 id，再引用/回复某条消息（是否允许 AI 主动使用由人格/策略决定；桥接会检测发送类工具调用并自动跳过该回合的重复自动转发）。同一 agent 回合里可以继续发送不同文本；防重复由消息身份、平台回执和每分钟/每小时发送预算负责，不再返回“本回合不能补第二批”的回合锁
   - 一代仿真模式（`reserved`）下，AI 可以只输出 `[SILENT]` 表示“潜水/不接话”，桥接会静默不发送
   - 一代仿真模式（`reserved`）按空格分句：AI 用空格表示拆成多条消息；中英文/数字之间的空格也会被当成分条信号，不想分条就不要加空格（`reserved2` 不适用，分条请用 `qq_send_message` 数组）
 
@@ -138,8 +138,8 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 | `webSearch.apiKeyEnv` / `apiKey` | 搜索凭据的环境变量名（默认 `DEEPSEEK_API_KEY`）/ 直接写死 key（不推荐）。都不设置时读 DSH 的 `$DSH_HOME/.credentials.yaml` 里同名 ref |
 | `webSearch.baseURL` / `model` / `maxUses` / `maxResults` | 搜索端点（默认 `https://api.deepseek.com/anthropic/v1`，必须 https 且解析到公网）、模型（默认 `deepseek-v4-flash`）、单次搜索最多用几次工具、返回条数上限 |
 | `workspaceTitle` | QQ 会话在 DSH 界面中的归组名称，默认「QQ 聊天」 |
-| `allow.private` / `allow.groups` | 白名单（QQ 号/群号数组）；留空且 `allowAllWhenEmpty: true` 时放行全部 |
-| `deny.*` | 黑名单，优先于白名单 |
+| `allow.private` / `allow.groups` | 聊天入口白名单（QQ 号/群号数组）；限制自动唤醒与普通会话操作。owner 用 `ownerKey` 明确指定目标时不受该列表限制 |
+| `deny.*` | 显式目标禁用项，优先于白名单，也阻止 ownerKey 绕过 |
 | `ackMessage` | 消息投递后的立即回复，空字符串关闭 |
 | `sendDelayMs` | QQ 连续发送间隔，防止触发频率限制 |
 | `consolePort` | 本地控制台端口，默认 `3100` |
@@ -361,7 +361,7 @@ SnowLuma 同一个账号的 **HTTP token（默认 3000 端口）与 WebSocket to
 
 ## 已知限制
 
-- agent 回复在回合结束时一次性发送（不做流式逐字转发）；回复超过 `socialV2.send.maxMessageChars`（默认 500 字，可用 `social.maxReplyChars` 调整）自动按句读/URL 边界分段
+- agent 回复在工具调用时发送（不做流式逐字转发）；一次调用可包含多条短气泡，也可以在后续有新消息或自然补充时再发不同文本。单条超过 `socialV2.send.maxMessageChars`（默认 500 字，可用 `social.maxReplyChars` 调整）时按句读/URL 边界分段
 - 图片及部分表情可以通过安全下载接入多模态模型；语音/视频以及无法取得图片字节的消息仍使用占位文本
 - **发**语音是支持的（独立工具的图形界面 / 命令行 / AI 工具，见 `docs/README.md` 的文档索引）；但**收**到的语音目前只显示占位文本，不做语音转写入上下文
 - **AI 发语音默认关闭**（`socialV2.voice.enabled` 与 `tools.sendVoice` 默认 `false`）：先把音频放进 `audio/`，再到控制台打开开关；你自己发语音不受这个开关影响

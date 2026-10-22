@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { isOwnerPrivateKey, ownerActionAllowed } from '../src/core/qq-owner-control.mjs';
 
 const ownerQQ = 3440189193;
@@ -19,5 +20,13 @@ assert.equal(ownerActionAllowed('send_qzone_msg', actions), true);
 assert.equal(ownerActionAllowed('get_qzone_msg_list', actions), true);
 assert.equal(ownerActionAllowed('send_group_msg', actions), false, '群发不能借 owner 通用动作绕过专用发送门');
 assert.equal(ownerActionAllowed('unknown_action', actions), false);
+
+const mcp = fs.readFileSync('src/mcp-snowluma-safe.js', 'utf8');
+assert.match(mcp, /function agentRequestHeaders\(token, ownerKey\)/);
+assert.match(mcp, /x-owner-key/);
+assert.match(mcp, /ownerKey: z\.string\(\)\.optional\(\)/);
+for (const tool of ['qq_send_message', 'qq_send_burst', 'qq_send_sticker', 'qq_send_voice', 'qq_send_image']) {
+  assert.ok(mcp.includes(`'${tool}'`), `${tool} must remain registered`);
+}
 
 console.log('owner QQ control policy: ok');

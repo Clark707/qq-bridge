@@ -29,6 +29,8 @@ import * as ownerAgentPolicy from '../src/core/owner-agent-policy.mjs';
 import * as qqOwnerControl from '../src/core/qq-owner-control.mjs';
 import * as mediaProcessError from '../src/core/media-process-error.mjs';
 import * as sendRateLimit from '../src/core/send-rate-limit.mjs';
+import * as replyCheckPolicy from '../src/core/reply-check-policy.mjs';
+import * as imageLib from '../src/image-lib.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -155,7 +157,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     markCapabilityV2, buildCapabilityStateV2,
-    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, scheduleReplyCheckV2, socialV2,
     ownerPrivateNeedsAttentionV2, pauseGroupAutonomyV2, yieldGroupToOwnerV2,
     groupSendScopeAllowedV2,
     claimInitiativeV2,
@@ -209,6 +211,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...inboundMedia, ...qqFaces, ...memoryEvidence, ...linkCard, ...contextPressure, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
     ...ownerAgentPolicy, ...qqOwnerControl, ...mediaProcessError, ...sendRateLimit,
+    ...replyCheckPolicy, ...imageLib,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

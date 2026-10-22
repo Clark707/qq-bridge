@@ -50,6 +50,12 @@ function getAccess() {
   };
 }
 
+function agentRequestHeaders(token, ownerKey) {
+  const headers = { 'x-agent-token': token };
+  if (ownerKey) headers['x-owner-key'] = String(ownerKey).trim();
+  return headers;
+}
+
 function getOneBotConfig() {
   const c = getConfig();
   return {
@@ -384,14 +390,28 @@ server.tool(
 
 server.tool(
   'qq_list_groups',
-  '列出机器人所在的全部 QQ 群（只读）：群号、群名。',
-  {},
-  async () => {
+  '列出机器人所在的 QQ 群（只读）：群号、群名。owner 私聊可传 key 与 token 读取全部群；不传时仅兼容 closed-agent。',
+  {
+    key: z.string().optional().describe('owner 私聊的会话 key，格式 private:QQ号；传入 token 时使用 owner 群读取'),
+    token: z.string().optional().describe('owner 私聊的会话令牌；与 key 同时传入'),
+  },
+  async ({ key, token } = {}) => {
+    if (key && token) {
+      try {
+        const data = await agentApi(
+          `/api/socialV2/owner/group-list?key=${encodeURIComponent(key)}`,
+          { headers: { 'x-agent-token': token } },
+        );
+        return { content: [{ type: 'text', text: serializeModelData(data.groups ?? []) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `获取群列表失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
     // 旧只读工具没有 agent token：只允许在封闭 agent（管理员私聊）里使用。
     // 判定失败一律拒绝（fail-closed），不依赖「看到某个模式才拒绝」的黑名单写法。
     try {
       if (!(await legacyReadToolAllowed())) {
-        return { content: [{ type: 'text', text: '旧只读工具仅在封闭 agent（管理员私聊）模式可用；其它模式请使用带会话令牌的 v2 读工具' }], isError: true };
+        return { content: [{ type: 'text', text: '没有 owner 会话令牌；旧模式只允许 closed-agent。owner 私聊请同时传 key 和 token。' }], isError: true };
       }
     } catch (error) {
       return { content: [{ type: 'text', text: `无法确认当前模式，拒绝执行：${error?.message ?? error}` }], isError: true };
@@ -411,13 +431,28 @@ server.tool(
 
 server.tool(
   'qq_get_group_members',
-  '列出指定群的成员列表（只读）：QQ 号、昵称、群名片。',
-  { groupId: z.union([z.number(), z.string()]).describe('群号') },
-  async ({ groupId }) => {
+  '列出指定群的成员列表（只读）：QQ 号、昵称、群名片。owner 私聊可传 key 与 token 读取任意群。',
+  {
+    groupId: z.union([z.number(), z.string()]).describe('群号'),
+    key: z.string().optional().describe('owner 私聊的会话 key，格式 private:QQ号；传入 token 时使用 owner 群读取'),
+    token: z.string().optional().describe('owner 私聊的会话令牌；与 key 同时传入'),
+  },
+  async ({ groupId, key, token }) => {
     const g = String(groupId);
+    if (key && token) {
+      try {
+        const data = await agentApi(
+          `/api/socialV2/owner/group-members?key=${encodeURIComponent(key)}&groupId=${encodeURIComponent(g)}`,
+          { headers: { 'x-agent-token': token } },
+        );
+        return { content: [{ type: 'text', text: serializeModelData(data.data ?? []) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `获取群成员失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
     try {
       if (!(await legacyReadToolAllowed())) {
-        return { content: [{ type: 'text', text: '旧只读工具仅在封闭 agent（管理员私聊）模式可用；其它模式请使用带会话令牌的 v2 读工具' }], isError: true };
+        return { content: [{ type: 'text', text: '没有 owner 会话令牌；旧模式只允许 closed-agent。owner 私聊请同时传 key 和 token。' }], isError: true };
       }
     } catch (error) {
       return { content: [{ type: 'text', text: `无法确认当前模式，拒绝读取：${error?.message ?? error}` }], isError: true };
@@ -438,13 +473,30 @@ server.tool(
 
 server.tool(
   'qq_get_group_history',
-  '获取指定群的最近消息历史（只读）。messageSeq 可选：从该消息序号往前取。注意：是否可用取决于 SnowLuma 是否实现 get_group_msg_history。',
-  { groupId: z.union([z.number(), z.string()]).describe('群号'), messageSeq: z.number().optional().describe('起始消息序号（可选）') },
-  async ({ groupId, messageSeq }) => {
+  '获取指定群的最近消息历史（只读）。owner 私聊可传 key 与 token 读取任意群。messageSeq 可选：从该消息序号往前取。',
+  {
+    groupId: z.union([z.number(), z.string()]).describe('群号'),
+    messageSeq: z.number().optional().describe('起始消息序号（可选）'),
+    key: z.string().optional().describe('owner 私聊的会话 key，格式 private:QQ号；传入 token 时使用 owner 群读取'),
+    token: z.string().optional().describe('owner 私聊的会话令牌；与 key 同时传入'),
+  },
+  async ({ groupId, messageSeq, key, token }) => {
     const g = String(groupId);
+    if (key && token) {
+      try {
+        const suffix = messageSeq === undefined ? '' : `&messageSeq=${encodeURIComponent(String(messageSeq))}`;
+        const data = await agentApi(
+          `/api/socialV2/owner/group-history?key=${encodeURIComponent(key)}&groupId=${encodeURIComponent(g)}${suffix}`,
+          { headers: { 'x-agent-token': token } },
+        );
+        return { content: [{ type: 'text', text: serializeModelData(data.data ?? data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `获取群历史失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
     try {
       if (!(await legacyReadToolAllowed())) {
-        return { content: [{ type: 'text', text: '旧只读工具仅在封闭 agent（管理员私聊）模式可用；其它模式请使用带会话令牌的 v2 读工具' }], isError: true };
+        return { content: [{ type: 'text', text: '没有 owner 会话令牌；旧模式只允许 closed-agent。owner 私聊请同时传 key 和 token。' }], isError: true };
       }
     } catch (error) {
       return { content: [{ type: 'text', text: `无法确认当前模式，拒绝读取：${error?.message ?? error}` }], isError: true };
@@ -466,21 +518,22 @@ server.tool(
 
 server.tool(
   'qq_send_group_message',
-  '向指定 QQ 群发送一条纯文本消息；如需引用某条消息，可传 replyToMessageId（非零整数，可为负数），可先用 qq_get_recent_messages / qq_get_message_detail 查询。二代模式（reserved2）下这是可用的发送工具之一，但优先使用 qq_send_message；reserved2 下调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
+  '向指定 QQ 群发送一条纯文本消息；如需引用某条消息，可传 replyToMessageId（非零整数，可为负数）。二代模式（reserved2）下调用时必须携带会话令牌 token。群会话令牌只能发送到自身群；owner 私聊要操作其他群时传 ownerKey，key 写实际目标，不需要把该群加入聊天白名单。不要在发送后输出“已发送”类汇报。',
   {
-    groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
+    groupId: z.union([z.number(), z.string()]).describe('目标群号；ownerKey 模式下可以是账号所在的任意群'),
     message: z.string().describe('消息文本，纯文本，不要用 Markdown 或 CQ 码'),
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
-    token: z.string().optional().describe('二代会话令牌（reserved2 模式下必填；closed-agent 模式不需要）')
+    token: z.string().optional().describe('二代会话令牌（reserved2 模式下必填；closed-agent 模式不需要）'),
+    ownerKey: z.string().optional().describe('owner 私聊的 key。由 owner 私聊跨目标发送时填写 private:QQ号；key/groupId/userId 仍填写真实目标')
   },
-  async ({ groupId, message, replyToMessageId, token }) => {
+  async ({ groupId, message, replyToMessageId, token, ownerKey }) => {
     try {
       const cleanMessage = unquoteJsonString(message);
       const data = await agentApi('/api/send/group', {
         method: 'POST',
         // token 既放 body（兼容旧调用）又放 header：桥接的「agent 流量」判定基于 header，
         // 只带 body 会让这条请求在桥接眼里像控制台请求，绕过 agent 专用的闸门与审计。
-        ...(token ? { headers: { 'x-agent-token': token } } : {}),
+        ...(token ? { headers: agentRequestHeaders(token, ownerKey) } : {}),
         body: JSON.stringify({ groupId: String(groupId), message: cleanMessage, replyToMessageId, token: token || undefined })
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -492,19 +545,20 @@ server.tool(
 
 server.tool(
   'qq_reply',
-  '在指定 QQ 群里引用/回复某条消息，并发送一条文本。适合群消息很多、需要明确“我回的是哪条”时使用；replyToMessageId 是被引用消息的 id（非零整数，QQ 消息 id 可能为负数），可先用 qq_get_recent_messages / qq_get_unread_messages / qq_get_message_detail 查到具体消息内容和 id。发送前桥接会校验该 id 存在且属于当前会话。二代模式下这是你正常可用的引用工具，但不要每条都引用。只有以下情况才需要引用：① 你这条消息指向的人或消息并非最新一条别人的消息（也就是你在回更早的某条）；② 你连续几句话里不同消息指代的是不同的消息或不同的人。其他情况（上下文唯一、刚在接同一条最新消息）不要引用，别让对方猜，也别为了用工具而用。reserved2 下调用时必须携带会话令牌 token。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
+  '在指定 QQ 群里引用/回复某条消息，并发送一条文本。适合群消息很多、需要明确“我回的是哪条”时使用；replyToMessageId 是被引用消息的 id（非零整数），发送前桥接会校验该 id 存在且属于当前目标。owner 私聊跨群回复时传 ownerKey，groupId 写实际目标；群会话令牌仍只能操作自身群。',
   {
-    groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
+    groupId: z.union([z.number(), z.string()]).describe('目标群号；ownerKey 模式下可以是账号所在的任意群'),
     replyToMessageId: z.union([z.number(), z.string()]).describe('被引用/回复的消息 id（非零整数，可为负数）'),
     message: z.string().describe('要发送的文本，纯文本，不要用 Markdown 或 CQ 码'),
-    token: z.string().optional().describe('二代会话令牌（reserved2 模式下必填；closed-agent 模式不需要）')
+    token: z.string().optional().describe('二代会话令牌（reserved2 模式下必填；closed-agent 模式不需要）'),
+    ownerKey: z.string().optional().describe('owner 私聊跨群发送时填写 owner 的 private:QQ号')
   },
-  async ({ groupId, replyToMessageId, message, token }) => {
+  async ({ groupId, replyToMessageId, message, token, ownerKey }) => {
     try {
       const cleanMessage = unquoteJsonString(message);
       const data = await agentApi('/api/send/reply', {
         method: 'POST',
-        ...(token ? { headers: { 'x-agent-token': token } } : {}),
+        ...(token ? { headers: agentRequestHeaders(token, ownerKey) } : {}),
         body: JSON.stringify({ groupId: String(groupId), replyToMessageId, message: cleanMessage, token: token || undefined })
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -516,19 +570,20 @@ server.tool(
 
 server.tool(
   'qq_send_private_message',
-  '向指定 QQ 好友发送一条私聊消息。若提供 replyToMessageId，会以 QQ 引用/回复形式发出（引用条 + 文本）。replyToMessageId 必须是非零整数消息 id（QQ 消息 id 可能为负数），可先用 qq_get_message_detail 查询。二代模式（reserved2）下这是可用的发送工具之一，但优先使用 qq_send_message；调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标 QQ 必须命中系统白名单（config.json 的 allow.private），否则拒绝。',
+  '向指定 QQ 好友发送一条私聊消息。owner 私聊跨好友发送时传 ownerKey，userId 写实际目标，不需要先把对方加入聊天白名单；普通私聊会话令牌仍只能回复自身会话。发送后不要输出“已发送”类汇报。',
   {
-    userId: z.union([z.number(), z.string()]).describe('好友 QQ 号（必须在白名单内）'),
+    userId: z.union([z.number(), z.string()]).describe('目标好友 QQ 号；ownerKey 模式下可以是任意好友'),
     message: z.string().describe('消息文本，纯文本，不要用 Markdown 或 CQ 码'),
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
-    token: z.string().optional().describe('二代会话令牌（reserved2 模式下必填；closed-agent 模式不需要）')
+    token: z.string().optional().describe('二代会话令牌（reserved2 模式下必填；closed-agent 模式不需要）'),
+    ownerKey: z.string().optional().describe('owner 私聊跨好友发送时填写 owner 的 private:QQ号')
   },
-  async ({ userId, message, replyToMessageId, token }) => {
+  async ({ userId, message, replyToMessageId, token, ownerKey }) => {
     try {
       const cleanMessage = unquoteJsonString(message);
       const data = await agentApi('/api/send/private', {
         method: 'POST',
-        ...(token ? { headers: { 'x-agent-token': token } } : {}),
+        ...(token ? { headers: agentRequestHeaders(token, ownerKey) } : {}),
         body: JSON.stringify({ userId: String(userId), message: cleanMessage, replyToMessageId, token: token || undefined })
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -662,11 +717,12 @@ server.tool(
   'qq_send_burst',
   '在指定 QQ 群分多条发送消息（二代仿真模式专用），桥接会按真人化随机间隔发送。暂不支持引用，需要引用请用 qq_reply。注意：数组里的每个字符串就是一条 QQ 消息，字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。',
   {
-    groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
+    groupId: z.union([z.number(), z.string()]).describe('目标群号；ownerKey 模式下可以是账号所在的任意群'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    messages: z.union([z.array(z.string()).min(1), z.string()]).describe('要发送的消息数组，每条为纯文本；也兼容传入 JSON 数组字符串')
+    messages: z.union([z.array(z.string()).min(1), z.string()]).describe('要发送的消息数组，每条为纯文本；也兼容传入 JSON 数组字符串'),
+    ownerKey: z.string().optional().describe('owner 私聊跨群发送时填写 owner 的 private:QQ号')
   },
-  async ({ groupId, token, messages }) => {
+  async ({ groupId, token, messages, ownerKey }) => {
     try {
       const key = `group:${groupId}`;
       let finalMessages = messages;
@@ -690,7 +746,7 @@ server.tool(
       const data = await agentApi('/api/socialV2/send-burst', {
         method: 'POST',
         body: JSON.stringify({ key, messages: finalMessages }),
-        headers: { 'x-agent-token': token },
+        headers: agentRequestHeaders(token, ownerKey),
         timeoutMs: 300000
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -706,6 +762,7 @@ server.tool(
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    ownerKey: z.string().optional().describe('owner 私聊跨目标操作时填写 owner 的 private:QQ号；key 仍是实际目标'),
     messages: z.union([z.string(), z.array(z.string()).min(1)]).describe('要发送的内容：字符串=一条；数组=分多条'),
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
     atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中用于点名某个人；与引用二选一即可，不要滥用）'),
@@ -713,7 +770,7 @@ server.tool(
     gapMs: z.number().optional().describe('fixed 模式下的统一间隔（毫秒）'),
     gaps: z.array(z.number()).optional().describe('fixed 模式下逐条间隔（长度=条数-1）')
   },
-  async ({ key, token, messages, replyToMessageId, atUserId, gapMode, gapMs, gaps }) => {
+  async ({ key, token, ownerKey, messages, replyToMessageId, atUserId, gapMode, gapMs, gaps }) => {
     try {
       let finalMessages = messages;
       if (typeof finalMessages === 'string') {
@@ -736,7 +793,7 @@ server.tool(
       const data = await agentApi('/api/socialV2/send-message', {
         method: 'POST',
         body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null, gapMode, gapMs, gaps }),
-        headers: { 'x-agent-token': token },
+        headers: agentRequestHeaders(token, ownerKey),
         timeoutMs: 300000
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -749,18 +806,19 @@ server.tool(
 if (cfg.socialV2?.tools?.sendPoke !== false) {
   server.tool(
     'qq_send_poke',
-    '发送 QQ 拍一拍（群聊/私聊）。适合用“戳一下”代替一句废话、提醒对方、自然回应别人的拍一拍，或偶尔主动戳一下正在聊的人/熟人——这样更拟真；但别频繁，真人不会一直戳人。群聊必须传 targetUserId（要拍的群友 QQ 号，可从 qq_get_active_members / qq_get_message_detail 的 userId 获取）；私聊可不传 targetUserId（默认拍当前私聊对象）。reserved2 下必须携带会话令牌 token，发送会受桥接白名单与发送频率限制。',
+    '发送 QQ 拍一拍（群聊/私聊）。owner 私聊跨目标拍一拍时传 ownerKey，key 写实际目标；普通群/私聊令牌只能操作自身会话。群聊必须传 targetUserId，私聊可省略。不要频繁拍人。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      ownerKey: z.string().optional().describe('owner 私聊跨目标操作时填写 owner 的 private:QQ号'),
       targetUserId: z.union([z.number(), z.string()]).optional().describe('要拍的群友 QQ 号（群聊必填；私聊可选）')
     },
-    async ({ key, token, targetUserId }) => {
+    async ({ key, token, ownerKey, targetUserId }) => {
       try {
         const data = await agentApi('/api/socialV2/send-poke', {
           method: 'POST',
           body: JSON.stringify({ key, targetUserId: targetUserId != null ? String(targetUserId) : '' }),
-          headers: { 'x-agent-token': token },
+          headers: agentRequestHeaders(token, ownerKey),
           timeoutMs: 60000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -1158,16 +1216,17 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      ownerKey: z.string().optional().describe('owner 私聊跨目标操作时填写 owner 的 private:QQ号'),
       stickerId: z.string().describe('表情标识：emoji_id / md5 / 图片 URL（来自 qq_list_stickers）'),
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
       atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
     },
-    async ({ key, token, stickerId, replyToMessageId, atUserId }) => {
+    async ({ key, token, ownerKey, stickerId, replyToMessageId, atUserId }) => {
       try {
         const data = await agentApi('/api/socialV2/send-sticker', {
           method: 'POST',
           body: JSON.stringify({ key, stickerId: String(stickerId), replyToMessageId, atUserId: atUserId ?? null }),
-          headers: { 'x-agent-token': token },
+          headers: agentRequestHeaders(token, ownerKey),
           timeoutMs: 300000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -1211,12 +1270,13 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      ownerKey: z.string().optional().describe('owner 私聊跨目标操作时填写 owner 的 private:QQ号'),
       voice: z.string().describe('owner 私聊可用本地绝对路径；其他会话用语音库文件名'),
       label: z.string().optional().describe('可选：写进会话记录里的说明，如「说了句晚安」'),
       verify: z.boolean().optional().describe('是否回读校验语音已落地（默认 true，建议保持开启）'),
       readback: z.boolean().optional().describe('是否额外索取 QQ 转写文本（自己发的语音通常没有，默认 false）')
     },
-    async ({ key, token, voice, label, verify, readback }) => {
+    async ({ key, token, ownerKey, voice, label, verify, readback }) => {
       try {
         const data = await agentApi('/api/socialV2/send-voice', {
           method: 'POST',
@@ -1228,7 +1288,7 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
             readback: readback === true,
             token
           }),
-          headers: { 'x-agent-token': token },
+          headers: agentRequestHeaders(token, ownerKey),
           timeoutMs: 300000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -1384,13 +1444,14 @@ if (cfg.socialV2?.tools?.sendImage !== false) {
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      ownerKey: z.string().optional().describe('owner 私聊跨目标操作时填写 owner 的 private:QQ号'),
       image: z.string().describe('owner 私聊可用本地绝对路径；其他会话用图片库相对路径'),
       intent: z.string().min(2).max(240).describe('为什么发这张图，例如“回一张刚生成的晚安图”'),
       expected: z.string().min(2).max(240).describe('预期效果，例如“看懂图里的文字后继续聊”'),
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（可选）'),
       atUserId: z.union([z.number(), z.string()]).optional().describe('群聊中要 @ 的 QQ 号（私聊不可用）')
     },
-    async ({ key, token, image, intent, expected, replyToMessageId, atUserId }) => {
+    async ({ key, token, ownerKey, image, intent, expected, replyToMessageId, atUserId }) => {
       try {
         const data = await agentApi('/api/socialV2/send-image', {
           method: 'POST',
@@ -1401,7 +1462,7 @@ if (cfg.socialV2?.tools?.sendImage !== false) {
             atUserId: atUserId ?? null,
             review: { intent, expected }
           }),
-          headers: { 'x-agent-token': token },
+          headers: agentRequestHeaders(token, ownerKey),
           timeoutMs: 300000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };

@@ -36,6 +36,16 @@ for (const { serverName, script } of SERVERS) {
           failures += 1;
         }
       }
+      const byName = new Map(tools.map((tool) => [tool.name, tool]));
+      for (const ownerReadTool of ['qq_list_groups', 'qq_get_group_members', 'qq_get_group_history']) {
+        const props = byName.get(ownerReadTool)?.inputSchema?.properties ?? {};
+        for (const field of ['key', 'token']) {
+          if (!Object.hasOwn(props, field)) {
+            console.log(`   ❌ ${ownerReadTool} 缺少 owner 读参数: ${field}`);
+            failures += 1;
+          }
+        }
+      }
     }
     // 校验 DSH 的命名契约：mcp__<serverName>__<rawName>
     const bad = names.filter((n) => !/^[A-Za-z0-9_-]{1,64}$/.test(n));
