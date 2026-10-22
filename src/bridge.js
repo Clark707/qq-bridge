@@ -13114,6 +13114,13 @@ async function main() {
               sender: row?.isOwner ? '老大' : String(row?.sender || '对方'),
               text: truncateText(String(row?.plain ?? row?.text ?? row?.tail ?? ''), 2000),
               is_owner: !!row?.isOwner,
+              media: (Array.isArray(row?.media) ? row.media : []).map((mediaItem) => ({
+                kind: String(mediaItem?.kind || ''),
+                summary: truncateText(String(mediaItem?.summary || ''), 300),
+                file: truncateText(String(mediaItem?.file || ''), 500),
+                face_id: truncateText(String(mediaItem?.faceId || ''), 100),
+                emoji_id: truncateText(String(mediaItem?.emojiId || ''), 100),
+              })),
             })),
             assistant_text: outbound.slice(0, 2000),
           },
