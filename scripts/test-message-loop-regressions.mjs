@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   evaluateReplyCheckWake,
 } from '../src/core/reply-check-policy.mjs';
@@ -40,5 +41,15 @@ assert.deepEqual(
   { shouldWake: false, reason: 'stale-unread' },
   'an already answered inbound message must not trigger another reply',
 );
+
+const bridgeSource = fs.readFileSync(new URL('../src/bridge.js', import.meta.url), 'utf8');
+const scheduleReply = bridgeSource.slice(
+  bridgeSource.indexOf('function scheduleSocialReply('),
+  bridgeSource.indexOf('function socialLoopTick('),
+);
+assert.match(scheduleReply, /\},\s*delay\);/,
+  'social reply timer must use its computed delay, never an out-of-scope scanMs');
+assert.match(scheduleReply, /if \(socialV2\.paused\) return;/,
+  'social reply timers must stop when socialV2 is paused');
 
 console.log('message loop regressions: ok');

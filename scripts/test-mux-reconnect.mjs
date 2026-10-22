@@ -65,6 +65,7 @@ s1.follow('session-AAA');
 await tick();
 check('首连即 follow 目标会话', followsOn(sockets[0]).includes('session-AAA'), `[${followsOn(sockets[0]).join(', ')}]`);
 check('$events 附加流已打开', frames.some((f) => f.socket === sockets[0] && f.frame.endpoint === '$events'));
+check('workspace/follow 已附加打开', frames.some((f) => f.socket === sockets[0] && f.frame.endpoint === 'workspace/follow'));
 
 // 模拟 DSH 重启 / WS 断开
 sockets[0].close();
@@ -76,6 +77,7 @@ await tick();
 sockets[1].simulateOpen();
 await tick(60);
 check('重连后重放了已有会话的 follow', followsOn(sockets[1]).includes('session-AAA'), `[${followsOn(sockets[1]).join(', ')}]`);
+check('重连后重开 workspace/follow', frames.some((f) => f.socket === sockets[1] && f.frame.endpoint === 'workspace/follow'));
 
 console.log(failed === 0 ? '\n✅ 事件流重连回归测试通过' : `\n❌ ${failed} 项失败`);
 process.exit(failed === 0 ? 0 : 1);

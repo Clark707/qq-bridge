@@ -1,6 +1,22 @@
+const TOOL_PROTOCOL_START = /<\s*(?:\uFF5C{2}|\|{1,2})\s*DSML[\s\S]*?<\/\s*(?:\uFF5C{2}|\|{1,2})\s*DSML(?:\uFF5C{2}|\|{1,2})\s*(?:calls|tool_calls)\s*>/gi;
+const TOOL_PROTOCOL_TAIL = /<\s*(?:\uFF5C{2}|\|{1,2})\s*DSML[\s\S]*$/i;
+const TOOL_PROTOCOL_FENCE = /<\/?\s*(?:\uFF5C{2}|\|{1,2})\s*DSML(?:\uFF5C{2}|\|{1,2})[^>]*>/gi;
+
+/**
+ * Remove model tool-protocol markup that escaped as ordinary assistant text.
+ * This is a transport artifact, not something she should say to anyone.
+ */
+export function stripToolProtocol(value) {
+  let text = String(value ?? '');
+  text = text.replace(TOOL_PROTOCOL_START, '');
+  text = text.replace(TOOL_PROTOCOL_TAIL, '');
+  text = text.replace(TOOL_PROTOCOL_FENCE, '');
+  return text.replace(/\n{3,}/g, '\n\n').trim();
+}
+
 // 把 agent 的 Markdown 回复转成适合 QQ 发送的纯文本。
 export function mdToPlain(md) {
-  let s = String(md ?? '');
+  let s = stripToolProtocol(md);
   // 代码块：保留内容，去掉围栏（内容尾部换行去掉，围栏后的换行自然保留一个分隔）
   s = s.replace(/```[a-zA-Z0-9_+-]*\n?([\s\S]*?)```/g, (_, body) => body.replace(/\n+$/, ''));
   // 行内代码

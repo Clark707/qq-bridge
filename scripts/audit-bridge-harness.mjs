@@ -30,6 +30,8 @@ import * as qqOwnerControl from '../src/core/qq-owner-control.mjs';
 import * as mediaProcessError from '../src/core/media-process-error.mjs';
 import * as sendRateLimit from '../src/core/send-rate-limit.mjs';
 import * as replyCheckPolicy from '../src/core/reply-check-policy.mjs';
+import * as systemErrorPolicy from '../src/core/system-error-policy.mjs';
+import * as workspaceArchive from '../src/core/workspace-archive-policy.mjs';
 import * as imageLib from '../src/image-lib.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -154,16 +156,17 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
-    sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
+    sendToQQ, sendSystemNotice, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     markCapabilityV2, buildCapabilityStateV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, scheduleReplyCheckV2, socialV2,
+    applyWorkspaceFollowFrame, isSessionArchived, sessionIsRegistered, socialLoopTick,
     ownerPrivateNeedsAttentionV2, pauseGroupAutonomyV2, yieldGroupToOwnerV2,
     groupSendScopeAllowedV2,
     claimInitiativeV2,
     outboundTextFromToolCall, postQueueEpisodeV2, turnInputBySession,
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
-    collectors, setupSleepTimerV2,
+    collectors, setupSleepTimerV2, scheduleProactiveCheckV2, clearAllSocialV2Timers,
     getInitialPrompt, setInitialPrompt, loadInitialPrompts, formatInitialPromptV2,
     initialPrompts, initialPromptMaxChars,
     extractMediaFromSegments, segmentsToText, fetchOneBotImage, fetchMediaData, resolveMediaList,
@@ -183,6 +186,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     setMode(value) { currentMode = value; },
     setReady(value) { dshReady = value; },
     setPresets(value) { dshPresetIds = value; dshDefaultPreset = 'standard'; },
+    getArchivedSessions() { return [...archivedDshSessions]; },
+    getArchivedConversationKeys() { return [...archivedConversationKeyCache]; },
     resetEpoch() { sessionEpoch++; },
   };
   bot.onPrivateMessage(async (event) => {`);
@@ -211,7 +216,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...inboundMedia, ...qqFaces, ...memoryEvidence, ...linkCard, ...contextPressure, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
     ...ownerAgentPolicy, ...qqOwnerControl, ...mediaProcessError, ...sendRateLimit,
-    ...replyCheckPolicy, ...imageLib,
+    ...replyCheckPolicy, ...systemErrorPolicy, ...workspaceArchive, ...imageLib,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

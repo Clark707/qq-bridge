@@ -764,6 +764,7 @@ export class NodeApiClient extends AbstractApiClient {
   /** 新版 DSH 的 agentPresets 命名空间是复数；旧版基类仍映射到 agentPreset.list。 */
   agentPresets = {
     list: (payload, signal) => this.callUnary('agentPresets.list', payload, signal),
+    select: (payload, signal) => this.callUnary('agentPresets.select', payload, signal),
   };
 
   /**
@@ -818,6 +819,7 @@ export class NodeApiClient extends AbstractApiClient {
     let wake;
     let socketOpen = false;
     let eventStreamId = null;
+    let workspaceStreamId = null;
     let eventClientId = null;
     let ended = false;
     const followed = new Set();
@@ -884,6 +886,24 @@ export class NodeApiClient extends AbstractApiClient {
         endStream();
       }
     };
+    const sendOpenWorkspace = () => {
+      if (ended || !socketOpen || workspaceStreamId) return;
+      const streamId = randomUUID();
+      workspaceStreamId = streamId;
+      try {
+        socket.send(JSON.stringify({
+          type: 'open',
+          streamId,
+          endpoint: 'workspace/follow',
+          payload: { args: {} }
+        }));
+        console.error('[dsh-client] opened workspace/follow stream');
+      } catch (error) {
+        console.error('[dsh-client] failed to open workspace/follow stream:', error?.message ?? error);
+        workspaceStreamId = null;
+        endStream();
+      }
+    };
     const handleOpen = () => {
       if (ended || sig.aborted) return;
       socketOpen = true;
@@ -892,6 +912,7 @@ export class NodeApiClient extends AbstractApiClient {
       // 少了这一步，DSH 一重启，所有已存在的 QQ 会话就会静默失联。
       for (const sid of this._desiredFollows) sendOpen(sid);
       sendOpenEvents();
+      sendOpenWorkspace();
       if (!ended) onOpen?.();
     };
     const handleMessage = (event) => {
@@ -906,8 +927,18 @@ export class NodeApiClient extends AbstractApiClient {
       }
       const sessionId = streamToSession.get(msg.streamId);
       const isEventStream = msg.streamId === eventStreamId;
+      const isWorkspaceStream = msg.streamId === workspaceStreamId;
       if (msg.type === 'item') {
-        if (isEventStream && msg.value) {
+        if (isWorkspaceStream && msg.value) {
+          console.error(`[dsh-client] workspace/follow item ${msg.value.type || 'unknown'}`);
+          enqueue({
+            kind: 'frame',
+            envelope: {
+              rpcId: msg.streamId,
+              payload: { type: 'workspace/follow', frame: msg.value }
+            }
+          });
+        } else if (isEventStream && msg.value) {
           const value = msg.value;
           if (value.type === 'ready') {
             eventClientId = value.clientId;
@@ -969,7 +1000,12 @@ export class NodeApiClient extends AbstractApiClient {
         }
         // 其余 snapshot 之外的帧（assistant-stream 等）当前桥接不需要，保持忽略。
       } else if (msg.type === 'end') {
-        if (isEventStream) {
+        if (isWorkspaceStream) {
+          workspaceStreamId = null;
+          setTimeout(() => {
+            if (!ended) sendOpenWorkspace();
+          }, 1000);
+        } else if (isEventStream) {
           eventStreamId = null;
           eventClientId = null;
           // 仅清掉 id 会让提问/审批通道永久失联；结束 mux 由桥接重连并重开。
@@ -992,7 +1028,13 @@ export class NodeApiClient extends AbstractApiClient {
           }
         }
       } else if (msg.type === 'error') {
-        if (isEventStream) {
+        if (isWorkspaceStream) {
+          console.error('[dsh-client] workspace/follow stream failed:', msg.error?.code || 'unknown error');
+          workspaceStreamId = null;
+          setTimeout(() => {
+            if (!ended) sendOpenWorkspace();
+          }, 2000);
+        } else if (isEventStream) {
           console.error('[dsh-client] $events stream failed:', msg.error?.code || 'unknown error');
           eventStreamId = null;
           eventClientId = null;
@@ -1005,7 +1047,10 @@ export class NodeApiClient extends AbstractApiClient {
           if (msg.error?.code === 'session/not-found') this._desiredFollows.delete(sessionId);
           enqueue({
             kind: 'frame',
-            envelope: { rpcId: msg.streamId, payload: { type: 'stream/error', error: msg.error } }
+            envelope: {
+              rpcId: msg.streamId,
+              payload: { type: 'stream/error', sessionId, error: msg.error }
+            }
           });
           if (msg.error?.code !== 'session/not-found') endStream();
         }

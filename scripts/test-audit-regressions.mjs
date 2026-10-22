@@ -149,6 +149,7 @@ await test('R4 timeout/replyCheck 类暂存唤醒按定时器语义补发', asyn
   const h = await bridgeHarness({ config: { socialV2: { proactive: { enabled: false } } } });
   try {
     h.setMode('reserved2');
+    await h.ensureSession('group:456');
     const st = h.getSocialV2State('group:456');
     // 模拟「回合结束、未读已全部标读」，队列里留着一条到期的 timeout 与一条已经处理过的 @
     st.unread = [];
@@ -719,6 +720,9 @@ await test('R21 QQ 回合把真实输入和工具回复写成同一条渠道 epi
     assert.equal(episode.body.source_ref, 's-owner:17');
     assert.match(episode.body.summary, /你消息发到哪去了/);
     assert.match(episode.body.summary, /发在私聊，没有发到群里/);
+    assert.equal(episode.body.details.user_messages[0].text, '你消息发到哪去了');
+    assert.equal(episode.body.details.user_messages[0].is_owner, true);
+    assert.equal(episode.body.details.assistant_text, '发在私聊，没有发到群里');
   } finally { await h.close(); }
 });
 
