@@ -45,7 +45,7 @@ import { isOwnerPrivateKey, ownerActionAllowed } from './core/qq-owner-control.m
 import { evaluateSendBudget } from './core/send-rate-limit.mjs';
 import { evaluateReplyCheckWake } from './core/reply-check-policy.mjs';
 import { mediaProcessFailure } from './core/media-process-error.mjs';
-import { planSystemErrorNotice } from './core/system-error-policy.mjs';
+import { planSystemErrorNotice, SYSTEM_ERROR_POLICY_VERSION } from './core/system-error-policy.mjs';
 import {
   loadSlang,
   saveSlang,
@@ -4145,6 +4145,7 @@ async function main() {
           await Promise.allSettled(Object.values(state.sessions).map((sessionId) => refreshSessionContext(sessionId)));
           sendJson({
             mode: currentMode,
+            systemErrorPolicy: SYSTEM_ERROR_POLICY_VERSION,
             closedAgentPreset,
             ownerAgentPreset: cfg.ownerAgentPreset || null,
             role: rs.role ?? null,

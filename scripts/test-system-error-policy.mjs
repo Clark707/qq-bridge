@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict'
-import { classifyExecutionFailure, planSystemErrorNotice } from '../src/core/system-error-policy.mjs'
+import {
+  classifyExecutionFailure,
+  planSystemErrorNotice,
+  SYSTEM_ERROR_POLICY_VERSION,
+} from '../src/core/system-error-policy.mjs'
 
+assert.equal(SYSTEM_ERROR_POLICY_VERSION, 'owner-private-v1')
 assert.equal(
   classifyExecutionFailure('Insufficient Balance (request_id: 1fe28bdc)'),
   'quota',

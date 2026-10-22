@@ -12,6 +12,8 @@ const FAILURE_TEXT = Object.freeze({
   unknown: '老大，这轮处理失败了，详情在日志里。',
 })
 
+export const SYSTEM_ERROR_POLICY_VERSION = 'owner-private-v1'
+
 export function classifyExecutionFailure(message) {
   const text = String(message ?? '')
   if (QUOTA_RE.test(text)) return 'quota'
